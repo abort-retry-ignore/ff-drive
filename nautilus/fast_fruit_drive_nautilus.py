@@ -1,8 +1,8 @@
 """
 Fast Fruit Drive — Nautilus emblems for iCloud WebDAV cache/upload state.
 
-Keeps update_file_info cheap (no directory walks). A 2s GLib timer re-reads
-only Dirty files and invalidates their emblems when upload finishes.
+Uses InfoProvider.update_file_info_full so Dirty files stay IN_PROGRESS and
+the emblem is refreshed when upload finishes (no Ctrl+R).
 
 Dirty (uploading):     emblem-synchronizing
 Cached and uploaded:   emblem-default
@@ -36,8 +36,6 @@ EMBLEM = {
 _cfg = None
 _cfg_at = 0.0
 _watched_dirty: set[str] = set()
-_cached: set[str] = set()
-_uri_for_rel: dict[str, str] = {}
 _dirty_dirs: set[str] = set()
 
 
@@ -125,8 +123,8 @@ def _read_one(rel: str) -> str:
         if data.get("Dirty") is True:
             return "dirty"
         return "cached"
-    if os.path.isdir(vfs_path) or os.path.isdir(meta_path):
-        return "cached" if os.path.isdir(vfs_path) else "remote"
+    if os.path.isdir(vfs_path):
+        return "cached"
     if rel and os.path.lexists(vfs_path):
         return "cached"
     return "remote"
@@ -137,63 +135,72 @@ def _status(rel: str, is_dir: bool) -> str:
         if rel in _watched_dirty or rel in _dirty_dirs:
             return "dirty"
         return _read_one(rel)
-    if rel in _watched_dirty:
-        return "dirty"
-    if rel in _cached:
-        return "cached"
     st = _read_one(rel)
     if st == "dirty":
         _watched_dirty.add(rel)
         _rebuild_dirty_dirs()
-    elif st == "cached":
-        _cached.add(rel)
+    else:
+        _watched_dirty.discard(rel)
+        _rebuild_dirty_dirs()
     return st
 
 
-def _invalidate(rel: str) -> None:
-    uri = _uri_for_rel.get(rel)
-    if not uri:
-        return
-    info = Nautilus.FileInfo.lookup_for_uri(uri)
-    if info is not None:
-        info.invalidate_extension_info()
-
-
-def _poll() -> bool:
-    finished = []
-    for rel in list(_watched_dirty):
-        if _read_one(rel) != "dirty":
-            finished.append(rel)
-    if not finished:
-        return True
-    for rel in finished:
-        _watched_dirty.discard(rel)
-        _cached.add(rel)
-    _rebuild_dirty_dirs()
-    for rel in finished:
-        _invalidate(rel)
-        for parent in _parents(rel):
-            _invalidate(parent)
-    return True
-
-
-GLib.timeout_add(2000, _poll)
+def _apply_emblem(file_info, status: str) -> None:
+    emblem = EMBLEM.get(status)
+    if emblem:
+        file_info.add_emblem(emblem)
 
 
 class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
+    def __init__(self):
+        super().__init__()
+        self._timers: dict[int, int] = {}
+
     def update_file_info(self, file_info):
         uri = file_info.get_uri() or ""
         rel = _rel_from_uri(uri)
         if rel is None:
             return
-        _uri_for_rel[rel] = uri
+        _apply_emblem(file_info, _status(rel, file_info.is_directory()))
+
+    def update_file_info_full(self, provider, handle, closure, file_info):
+        uri = file_info.get_uri() or ""
+        rel = _rel_from_uri(uri)
+        if rel is None:
+            return Nautilus.OperationResult.COMPLETE
         st = _status(rel, file_info.is_directory())
-        emblem = EMBLEM.get(st)
-        if emblem:
-            file_info.add_emblem(emblem)
+        _apply_emblem(file_info, st)
+        if st != "dirty" or file_info.is_directory():
+            return Nautilus.OperationResult.COMPLETE
+        timer = GLib.timeout_add_seconds(
+            2, self._poll_dirty, provider, handle, closure, file_info, rel
+        )
+        self._timers[id(handle)] = timer
+        return Nautilus.OperationResult.IN_PROGRESS
+
+    def _poll_dirty(self, provider, handle, closure, file_info, rel):
+        try:
+            gone = file_info.is_gone()
+        except Exception:
+            gone = True
+        if gone:
+            self._finish(provider, handle, closure, Nautilus.OperationResult.FAILED)
+            return False
+        st = _status(rel, False)
+        _apply_emblem(file_info, st)
         if st == "dirty":
-            for parent in _parents(rel):
-                if parent not in _uri_for_rel:
-                    parent_uri = uri.rsplit("/", 1)[0] + ("/" if parent == "" else "")
-                    # best-effort; lookup uses stored uris
-                    pass
+            return True
+        self._finish(provider, handle, closure, Nautilus.OperationResult.COMPLETE)
+        return False
+
+    def _finish(self, provider, handle, closure, result):
+        self._timers.pop(id(handle), None)
+        try:
+            Nautilus.info_provider_update_complete_invoke(closure, provider, handle, result)
+        except TypeError:
+            Nautilus.info_provider_update_complete_invoke(provider, handle, closure, result)
+
+    def cancel_update(self, provider, handle):
+        timer = self._timers.pop(id(handle), None)
+        if timer is not None:
+            GLib.source_remove(timer)
