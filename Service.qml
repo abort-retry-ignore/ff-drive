@@ -15,6 +15,8 @@ Item {
   property bool readOnly: true
   property bool rcloneFound: false
   property bool remoteConfigured: false
+  property bool hasSession: false
+  property bool needsLogin: false
   property bool gvfsDav: false
   property bool refreshing: false
   property string statusText: "Checking…"
@@ -83,6 +85,8 @@ Item {
     readOnly = parsed.readOnly !== false
     rcloneFound = parsed.rcloneFound === true
     remoteConfigured = parsed.remoteConfigured === true
+    hasSession = parsed.hasSession === true
+    needsLogin = parsed.needsLogin === true
     gvfsDav = parsed.gvfsDav === true
     statusText = String(parsed.statusText || (running ? "Connected" : "Stopped"))
     remote = String(parsed.remote || "icloud:")
@@ -113,6 +117,10 @@ Item {
   function stop() { runControl(["stop"], 0) }
   function toggleRunning() { active ? stop() : start() }
   function openDrive() { runControl(["open"]) }
+  function login() { runControl(["login"]) }
+  function setReadOnly(on) {
+    runControl(["configure", "read_only=" + (on ? "true" : "false"), "restart=1"])
+  }
 
   function applySettings() {
     var key = configKey()
@@ -120,14 +128,12 @@ Item {
     _appliedKey = key
     runControl([
       "configure",
-      "read_only=" + settingReadOnly,
       "cache_max_size=" + settingCacheMaxSize,
       "cache_max_age=" + settingCacheMaxAgeHours + "h",
       "restart=1"
     ])
   }
 
-  onSettingReadOnlyChanged: applySettings()
   onSettingCacheMaxSizeChanged: applySettings()
   onSettingCacheMaxAgeHoursChanged: applySettings()
 

@@ -20,6 +20,8 @@ function defaultStatus(error) {
     readOnly: true,
     rcloneFound: false,
     remoteConfigured: false,
+    hasSession: false,
+    needsLogin: false,
     gvfsDav: false,
     cacheUsedBytes: 0,
     statusText: error || "Unavailable",

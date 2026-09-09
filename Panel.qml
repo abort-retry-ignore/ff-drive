@@ -81,6 +81,7 @@ Panel {
     function start(): string { drive.start(); return "ok" }
     function stop(): string { drive.stop(); return "ok" }
     function files(): string { drive.openDrive(); return "ok" }
+    function login(): string { drive.login(); return "ok" }
     function status(): string { return drive.statusText }
   }
 
@@ -129,6 +130,7 @@ Panel {
         if (t === "r" || t === "R") drive.refresh()
         else if (t === "o" || t === "O") drive.openDrive()
         else if (t === "p" || t === "P") root.toggleRunning()
+        else if (t === "i" || t === "I") drive.login()
       }
 
       Column {
@@ -206,9 +208,70 @@ Panel {
             wrapMode: Text.WordWrap
             function setupText() {
               if (!drive.rcloneFound) return "Install rclone and put it on PATH."
-              if (!drive.remoteConfigured) return "Add an rclone remote named icloud (iclouddrive), then toggle this widget on."
+              if (drive.needsLogin) return "Sign in with your Apple ID password and 2FA. rclone keeps a trust token for about 30 days, then you sign in again. App-specific passwords are not accepted."
               if (!drive.gvfsDav) return "Install gvfs-dnssd so Nautilus can speak WebDAV."
               return "Fruit Drive is not ready yet."
+            }
+          }
+        }
+
+        CursorSurface {
+          id: loginRow
+          visible: drive.needsLogin
+          width: parent.width
+          hasCursor: root.cursorActive && root.focusSection === "login"
+          foreground: root.foreground
+          implicitHeight: loginInner.implicitHeight + Style.spacing.rowPaddingX
+
+          MouseArea {
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onEntered: { root.cursorActive = true; root.focusSection = "login" }
+            onClicked: drive.login()
+          }
+
+          RowLayout {
+            id: loginInner
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(8)
+            Text {
+              text: "󰌆"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.icon
+            }
+            ColumnLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(1)
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: drive.remoteConfigured ? "Reconnect iCloud" : "Sign in to iCloud"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: "Apple ID + 2FA in a terminal"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+            PanelActionButton {
+              iconText: "󰌋"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: drive.login()
             }
           }
         }
@@ -218,9 +281,36 @@ Panel {
           width: parent.width
           spacing: Style.spacing.labelGap
           InfoPair { label: "Shown as"; value: drive.displayName }
-          InfoPair { label: "Mode"; value: Model.modeText(drive.readOnly) }
           InfoPair { label: "Cache"; value: Model.cacheText(drive.cacheUsedBytes, drive.cacheMaxSize) }
           InfoPair { label: "Remote"; value: drive.remote }
+        }
+
+        Item {
+          visible: drive.ready
+          width: parent.width
+          implicitHeight: roRow.implicitHeight
+
+          RowLayout {
+            id: roRow
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              textFormat: Text.PlainText
+              text: "Read-only"
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              Layout.fillWidth: true
+            }
+            ToggleSwitch {
+              id: roSwitch
+              checked: drive.readOnly
+              busy: drive.busy
+              foreground: root.foreground
+              onToggled: drive.setReadOnly(!drive.readOnly)
+            }
+          }
         }
 
         PanelSeparator {

@@ -19,20 +19,11 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "readOnly": "On",
       "cacheMaxSize": "4G",
       "cacheMaxAgeHours": 24,
       "refreshIntervalSec": 15
     },
     "schema": [
-      {
-        "key": "readOnly",
-        "type": "enum",
-        "label": "Read-only",
-        "options": ["On", "Off"],
-        "defaultValue": "On",
-        "description": "When On, Nautilus cannot delete, move, or overwrite anything on iCloud."
-      },
       {
         "key": "cacheMaxSize",
         "type": "enum",

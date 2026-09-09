@@ -14,15 +14,26 @@ it were local. Nautilus WebDAV lists folders on demand, skips thumbnails when
 iCloud cannot stream/seek, so opened files are hydrated into a capped local
 cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
 
+## Sign-in and token expiry
+
+iCloud login is **rclone's**, not this plugin's. The widget's **Sign in** button
+opens a terminal and runs `rclone config reconnect icloud:` (or `rclone config`
+if the remote does not exist yet).
+
+- Use your real Apple ID password and 2FA. App-specific passwords are rejected.
+- rclone stores `trust_token` / `cookies` in `~/.config/rclone/rclone.conf`.
+- That trust token lasts **about 30 days**. After it expires, Sign in again.
+- Fast Fruit Drive never copies or replaces that file; it only reads whether a
+  session exists.
+
 ## Requirements
 
 - [Omarchy](https://omarchy.org/)
-- `rclone` with an `icloud` remote (`type = iclouddrive`)
+- `rclone`
 - `gvfs-dnssd` (Nautilus WebDAV backend)
 
 ```bash
 omarchy pkg add gvfs-dnssd
-rclone config   # create remote named "icloud", backend iclouddrive
 ```
 
 ## Install
