@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "id": "fast-fruit-drive",
+  "name": "Fast Fruit Drive",
+  "version": "0.1.0",
+  "author": "Igor Divjak",
+  "license": "MIT",
+  "description": "On-demand iCloud Drive in Nautilus via rclone WebDAV. Browse fast, cache only what you open, read-only by default.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Fast Fruit Drive",
+    "description": "Start iCloud Drive in Nautilus, toggle read-only, and cap the local cache.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "readOnly": "On",
+      "cacheMaxSize": "4G",
+      "cacheMaxAgeHours": 24,
+      "refreshIntervalSec": 15
+    },
+    "schema": [
+      {
+        "key": "readOnly",
+        "type": "enum",
+        "label": "Read-only",
+        "options": ["On", "Off"],
+        "defaultValue": "On",
+        "description": "When On, Nautilus cannot delete, move, or overwrite anything on iCloud."
+      },
+      {
+        "key": "cacheMaxSize",
+        "type": "enum",
+        "label": "Local cache size",
+        "options": ["512M", "1G", "2G", "4G", "8G", "16G"],
+        "defaultValue": "4G",
+        "description": "Maximum disk used for files you actually open. The rest of iCloud stays in the cloud."
+      },
+      {
+        "key": "cacheMaxAgeHours",
+        "type": "integer",
+        "label": "Cache max age (hours)",
+        "min": 1,
+        "max": 168,
+        "step": 1,
+        "defaultValue": 24
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}

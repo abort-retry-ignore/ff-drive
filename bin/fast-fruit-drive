@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+# Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
+set -euo pipefail
+
+APP=fast-fruit-drive
+UNIT=fast-fruit-drive.service
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PLUGIN_DIR=$(cd "$HERE/.." && pwd)
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
+CONFIG_FILE="$CONFIG_DIR/config"
+UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
+BOOKMARKS="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookmarks"
+
+DEFAULT_REMOTE="icloud:"
+DEFAULT_ADDR="127.0.0.1:8080"
+DEFAULT_READ_ONLY="true"
+DEFAULT_CACHE_MAX_SIZE="4G"
+DEFAULT_CACHE_MAX_AGE="24h"
+DEFAULT_DISPLAY_NAME="iCloud Drive"
+DEFAULT_VFS_CACHE_MODE="full"
+
+usage() {
+  cat <<EOF
+Usage: $APP <command> [args]
+
+Commands:
+  status                         JSON status for the bar widget
+  start                          Start WebDAV, mount, bookmark as iCloud Drive
+  stop                           Stop WebDAV and unmount
+  restart                        Restart the user service
+  toggle                         Start if stopped, stop if running
+  open                           Start if needed and open in Nautilus
+  serve                          Exec rclone (systemd ExecStart)
+  ensure                         Write unit, config, and Nautilus bookmark
+  configure KEY=VAL [...]        Update config; add restart=1 to bounce rclone
+  help                           Show this help
+EOF
+}
+
+fail() {
+  echo "$APP: $*" >&2
+  exit 1
+}
+
+bool() {
+  case "${1,,}" in
+    1|true|yes|on) echo true ;;
+    0|false|no|off) echo false ;;
+    *) echo "$1" ;;
+  esac
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$(dirname "$UNIT_FILE")" "$(dirname "$BOOKMARKS")"
+}
+
+write_default_config() {
+  ensure_dirs
+  if [[ ! -f $CONFIG_FILE ]]; then
+    cat >"$CONFIG_FILE" <<EOF
+remote=$DEFAULT_REMOTE
+addr=$DEFAULT_ADDR
+read_only=$DEFAULT_READ_ONLY
+cache_max_size=$DEFAULT_CACHE_MAX_SIZE
+cache_max_age=$DEFAULT_CACHE_MAX_AGE
+display_name=$DEFAULT_DISPLAY_NAME
+vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
+EOF
+  fi
+}
+
+load_config() {
+  write_default_config
+  remote=$DEFAULT_REMOTE
+  addr=$DEFAULT_ADDR
+  read_only=$DEFAULT_READ_ONLY
+  cache_max_size=$DEFAULT_CACHE_MAX_SIZE
+  cache_max_age=$DEFAULT_CACHE_MAX_AGE
+  display_name=$DEFAULT_DISPLAY_NAME
+  vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
+  # shellcheck disable=SC1090
+  while IFS='=' read -r key value; do
+    [[ -z ${key:-} || $key == \#* ]] && continue
+    case $key in
+      remote) remote=$value ;;
+      addr) addr=$value ;;
+      read_only) read_only=$(bool "$value") ;;
+      cache_max_size) cache_max_size=$value ;;
+      cache_max_age) cache_max_age=$value ;;
+      display_name) display_name=$value ;;
+      vfs_cache_mode) vfs_cache_mode=$value ;;
+    esac
+  done <"$CONFIG_FILE"
+  [[ $remote == *: ]] || remote="${remote}:"
+  dav_uri="dav://${addr}/"
+}
+
+find_rclone() {
+  if [[ -x $HOME/.local/bin/rclone ]]; then
+    echo "$HOME/.local/bin/rclone"
+    return
+  fi
+  command -v rclone 2>/dev/null || true
+}
+
+remote_configured() {
+  local rclone_bin=$1
+  [[ -n $rclone_bin ]] || return 1
+  "$rclone_bin" listremotes 2>/dev/null | grep -Fxq "$remote"
+}
+
+write_unit() {
+  load_config
+  cat >"$UNIT_FILE" <<EOF
+[Unit]
+Description=Fast Fruit Drive — rclone iCloud WebDAV for Nautilus
+After=network-online.target
+Wants=network-online.target
+
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=$HERE/$APP serve
+Restart=on-failure
+RestartSec=5s
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$APP
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable "$UNIT" >/dev/null
+}
+
+ensure_bookmark() {
+  load_config
+  local tmp line
+  mkdir -p "$(dirname "$BOOKMARKS")"
+  touch "$BOOKMARKS"
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* ]] && continue
+    printf '%s\n' "$line"
+  done <"$BOOKMARKS" >"$tmp"
+  printf '%s %s\n' "$dav_uri" "$display_name" >>"$tmp"
+  mv "$tmp" "$BOOKMARKS"
+}
+
+service_running() {
+  systemctl --user is-active --quiet "$UNIT"
+}
+
+gio_mounted() {
+  load_config
+  gio mount -l 2>/dev/null | grep -Fq "$dav_uri"
+}
+
+mount_dav() {
+  load_config
+  gio mount "$dav_uri" >/dev/null 2>&1 || true
+}
+
+unmount_dav() {
+  load_config
+  gio mount -u "$dav_uri" >/dev/null 2>&1 || true
+}
+
+cache_bytes() {
+  if [[ -d $CACHE_DIR ]]; then
+    du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}'
+  else
+    echo 0
+  fi
+}
+
+cmd_ensure() {
+  load_config
+  write_unit
+  ensure_bookmark
+}
+
+cmd_serve() {
+  load_config
+  local rclone_bin
+  rclone_bin=$(find_rclone)
+  [[ -n $rclone_bin ]] || fail "rclone not found"
+  remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured"
+  mkdir -p "$CACHE_DIR"
+  local args=(
+    serve webdav "$remote"
+    --addr "$addr"
+    --vfs-cache-mode "$vfs_cache_mode"
+    --vfs-cache-max-size "$cache_max_size"
+    --vfs-cache-max-age "$cache_max_age"
+    --vfs-read-ahead 0
+    --poll-interval 0
+    --dir-cache-time 30s
+    --cache-dir "$CACHE_DIR"
+  )
+  if [[ $read_only == true ]]; then
+    args+=(--read-only)
+  fi
+  exec "$rclone_bin" "${args[@]}"
+}
+
+cmd_start() {
+  cmd_ensure
+  local rclone_bin
+  rclone_bin=$(find_rclone)
+  [[ -n $rclone_bin ]] || fail "rclone not found (install rclone and put it on PATH)"
+  remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured — run: rclone config"
+  [[ -x /usr/lib/gvfsd-dav ]] || fail "Nautilus WebDAV is missing — install gvfs-dnssd"
+  systemctl --user start "$UNIT"
+  for _ in $(seq 1 20); do
+    service_running && break
+    sleep 0.15
+  done
+  service_running || fail "service failed to start — see: journalctl --user -u $UNIT"
+  mount_dav
+  ensure_bookmark
+}
+
+cmd_stop() {
+  unmount_dav
+  systemctl --user stop "$UNIT" 2>/dev/null || true
+}
+
+cmd_restart() {
+  cmd_ensure
+  systemctl --user restart "$UNIT"
+  sleep 0.3
+  mount_dav
+  ensure_bookmark
+}
+
+cmd_toggle() {
+  if service_running; then
+    cmd_stop
+  else
+    cmd_start
+  fi
+}
+
+cmd_open() {
+  load_config
+  service_running || cmd_start
+  mount_dav
+  ensure_bookmark
+  if command -v uwsm-app >/dev/null 2>&1; then
+    uwsm-app -- nautilus "$dav_uri" >/dev/null 2>&1 &
+  else
+    nautilus "$dav_uri" >/dev/null 2>&1 &
+  fi
+}
+
+cmd_configure() {
+  load_config
+  local restart=false
+  local key value changed=false
+  for pair in "$@"; do
+    key=${pair%%=*}
+    value=${pair#*=}
+    case $key in
+      read_only) value=$(bool "$value"); [[ $value == "$read_only" ]] || changed=true; read_only=$value ;;
+      cache_max_size) [[ $value == "$cache_max_size" ]] || changed=true; cache_max_size=$value ;;
+      cache_max_age) [[ $value == "$cache_max_age" ]] || changed=true; cache_max_age=$value ;;
+      cache_max_age_hours)
+        value="${value}h"
+        [[ $value == "$cache_max_age" ]] || changed=true
+        cache_max_age=$value
+        ;;
+      remote) [[ $value == "$remote" ]] || changed=true; remote=$value ;;
+      addr) [[ $value == "$addr" ]] || changed=true; addr=$value ;;
+      display_name) [[ $value == "$display_name" ]] || changed=true; display_name=$value ;;
+      vfs_cache_mode) [[ $value == "$vfs_cache_mode" ]] || changed=true; vfs_cache_mode=$value ;;
+      restart) restart=$(bool "$value") ;;
+      *) fail "unknown configure key: $key" ;;
+    esac
+  done
+  cat >"$CONFIG_FILE" <<EOF
+remote=$remote
+addr=$addr
+read_only=$read_only
+cache_max_size=$cache_max_size
+cache_max_age=$cache_max_age
+display_name=$display_name
+vfs_cache_mode=$vfs_cache_mode
+EOF
+  if [[ $restart == true && $changed == true ]] && service_running; then
+    cmd_restart
+  else
+    ensure_bookmark
+  fi
+}
+
+cmd_status() {
+  load_config
+  local rclone_bin running mounted configured gvfs rclone_found cache_used
+  rclone_bin=$(find_rclone)
+  rclone_found=false
+  [[ -n $rclone_bin ]] && rclone_found=true
+  configured=false
+  if [[ $rclone_found == true ]] && remote_configured "$rclone_bin"; then
+    configured=true
+  fi
+  running=false
+  service_running && running=true
+  mounted=false
+  gio_mounted && mounted=true
+  gvfs=false
+  [[ -x /usr/lib/gvfsd-dav ]] && gvfs=true
+  cache_used=$(cache_bytes)
+  local ready=false
+  [[ $rclone_found == true && $configured == true && $gvfs == true ]] && ready=true
+  local status_text="Stopped"
+  if [[ $ready != true ]]; then
+    if [[ $rclone_found != true ]]; then
+      status_text="rclone not found"
+    elif [[ $configured != true ]]; then
+      status_text="rclone remote '$remote' missing"
+    elif [[ $gvfs != true ]]; then
+      status_text="install gvfs-dnssd"
+    fi
+  elif [[ $running == true ]]; then
+    status_text="Connected"
+    [[ $mounted == true ]] || status_text="Serving"
+  fi
+  jq -n \
+    --argjson ok true \
+    --argjson ready "$ready" \
+    --argjson running "$running" \
+    --argjson mounted "$mounted" \
+    --argjson readOnly "$read_only" \
+    --argjson rcloneFound "$rclone_found" \
+    --argjson remoteConfigured "$configured" \
+    --argjson gvfsDav "$gvfs" \
+    --argjson cacheUsedBytes "$cache_used" \
+    --arg statusText "$status_text" \
+    --arg remote "$remote" \
+    --arg addr "$addr" \
+    --arg uri "$dav_uri" \
+    --arg displayName "$display_name" \
+    --arg cacheMaxSize "$cache_max_size" \
+    --arg cacheMaxAge "$cache_max_age" \
+    --arg cachePath "$CACHE_DIR" \
+    --arg lastError "" \
+    '{
+      ok: $ok,
+      ready: $ready,
+      running: $running,
+      mounted: $mounted,
+      readOnly: $readOnly,
+      rcloneFound: $rcloneFound,
+      remoteConfigured: $remoteConfigured,
+      gvfsDav: $gvfsDav,
+      cacheUsedBytes: $cacheUsedBytes,
+      statusText: $statusText,
+      remote: $remote,
+      addr: $addr,
+      uri: $uri,
+      displayName: $displayName,
+      cacheMaxSize: $cacheMaxSize,
+      cacheMaxAge: $cacheMaxAge,
+      cachePath: $cachePath,
+      lastError: $lastError
+    }'
+}
+
+cmd=${1:-help}
+shift || true
+case $cmd in
+  status) cmd_status ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  toggle) cmd_toggle ;;
+  open) cmd_open ;;
+  serve) cmd_serve ;;
+  ensure) cmd_ensure ;;
+  configure) cmd_configure "$@" ;;
+  help|-h|--help) usage ;;
+  *) fail "unknown command: $cmd" ;;
+esac

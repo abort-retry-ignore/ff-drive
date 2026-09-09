@@ -1,0 +1,6 @@
+*~
+*.qmlc
+*.jsc
+.DS_Store
+.idea/
+.vscode/
