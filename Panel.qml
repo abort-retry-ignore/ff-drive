@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "fast-fruit-drive"
-  ipcTarget: "fast-fruit-drive"
+  moduleName: "io.github.abort-retry-ignore.ff-drive"
+  ipcTarget: "io.github.abort-retry-ignore.ff-drive"
   manageIpc: false
 
   property string focusSection: "toggle"

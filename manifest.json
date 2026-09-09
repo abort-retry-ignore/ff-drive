@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "fast-fruit-drive",
+  "id": "io.github.abort-retry-ignore.ff-drive",
   "name": "Fast Fruit Drive",
   "version": "0.1.0",
   "author": "Igor Divjak",

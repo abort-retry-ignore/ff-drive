@@ -38,6 +38,7 @@ Commands:
   serve                          Exec rclone (systemd ExecStart)
   ensure                         Write unit, config, and Nautilus bookmark
   configure KEY=VAL [...]        Update config; add restart=1 to bounce rclone
+  uninstall                      Stop the service and remove unit, bookmark, emblems
   help                           Show this help
 EOF
 }
@@ -344,7 +345,7 @@ cmd_open() {
 
 cmd_login() {
   if command -v omarchy >/dev/null 2>&1; then
-    omarchy launch tui --app-id=org.omarchy.fast-fruit-drive-login "$HERE/$APP" login-tui
+    omarchy launch tui --app-id=io.github.abort-retry-ignore.ff-drive-login "$HERE/$APP" login-tui
     return
   fi
   if command -v xdg-terminal-exec >/dev/null 2>&1; then
@@ -414,6 +415,33 @@ cmd_configure() {
   else
     ensure_bookmark
   fi
+}
+
+remove_bookmark() {
+  load_config
+  local tmp line
+  [[ -f $BOOKMARKS ]] || return 0
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done <"$BOOKMARKS" >"$tmp"
+  mv "$tmp" "$BOOKMARKS"
+}
+
+remove_nautilus_extension() {
+  rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions/fast_fruit_drive_nautilus.py"
+}
+
+cmd_uninstall() {
+  cmd_stop
+  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
+  rm -f "$UNIT_FILE"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  remove_bookmark
+  remove_nautilus_extension
 }
 
 cmd_status() {
@@ -511,6 +539,7 @@ case $cmd in
   serve) cmd_serve ;;
   ensure) cmd_ensure ;;
   configure) cmd_configure "$@" ;;
+  uninstall) cmd_uninstall ;;
   help|-h|--help) usage ;;
   *) fail "unknown command: $cmd" ;;
 esac

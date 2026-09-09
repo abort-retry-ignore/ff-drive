@@ -5,14 +5,55 @@ WebDAV. Listings stay in the cloud; only files you open are cached on disk.
 
 Nautilus shows it as **iCloud Drive**, not `127.0.0.1:8080`.
 
-## Why
+Plugin id: `io.github.abort-retry-ignore.ff-drive`  
+License: MIT (see [LICENSE](LICENSE))
 
-A FUSE mount of the whole drive (rclone mount / StratoSync) walks iCloud as if
-it were local. Nautilus WebDAV lists folders on demand, skips thumbnails when
-`show-image-thumbnails` is `local-only`, and is much snappier for browsing.
+## Install
 
-iCloud cannot stream/seek, so opened files are hydrated into a capped local
-cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
+```sh
+omarchy plugin add https://github.com/abort-retry-ignore/ff-drive.git --enable
+```
+
+Then click the fruit icon on the bar and toggle it on. Nautilus gets a sidebar
+bookmark named **iCloud Drive**. Restart Nautilus once after the first start
+(`nautilus -q`) so emblems load.
+
+## Remove
+
+Stop the local WebDAV server and delete the files this plugin created, then
+remove the plugin. Do this **before** `omarchy plugin remove`, or the user
+systemd unit will still point at a deleted helper.
+
+```sh
+~/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive/bin/fast-fruit-drive uninstall
+omarchy plugin remove io.github.abort-retry-ignore.ff-drive
+```
+
+`uninstall` stops the service, disables and deletes
+`~/.config/systemd/user/fast-fruit-drive.service`, removes the **iCloud Drive**
+GTK bookmark this plugin added, and removes the Nautilus emblem extension.
+It does **not** touch `~/.config/rclone/rclone.conf`, this plugin's own config,
+or the local cache.
+
+Optional leftovers:
+
+```sh
+rm -rf ~/.config/fast-fruit-drive ~/.cache/fast-fruit-drive
+```
+
+## Requirements
+
+- [Omarchy](https://omarchy.org/) with third-party shell plugins
+- [`rclone`](https://rclone.org/downloads/) on `PATH` (or `~/.local/bin/rclone`)
+- `gvfs-dnssd` (Nautilus WebDAV backend)
+- `nautilus-python` (emblems; optional)
+
+```sh
+omarchy pkg add gvfs-dnssd nautilus-python
+```
+
+Install rclone from your package manager or [rclone.org/downloads](https://rclone.org/downloads/).
+This plugin never downloads or executes remote installers.
 
 ## Sign-in and token expiry
 
@@ -26,26 +67,22 @@ if the remote does not exist yet).
 - Fast Fruit Drive never copies or replaces that file; it only reads whether a
   session exists.
 
-## Requirements
+## Why
 
-- [Omarchy](https://omarchy.org/)
-- `rclone`
-- `gvfs-dnssd` (Nautilus WebDAV backend)
+A FUSE mount of the whole drive (rclone mount / StratoSync) walks iCloud as if
+it were local. Nautilus WebDAV lists folders on demand, skips thumbnails when
+`show-image-thumbnails` is `local-only`, and is much snappier for browsing.
 
-```bash
-omarchy pkg add gvfs-dnssd
-```
+iCloud cannot stream/seek, so opened files are hydrated into a capped local
+cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
 
-## Install
+## Usage
 
-```bash
-omarchy plugin add /path/to/fast-fruit-drive --enable
-# later, from git:
-# omarchy plugin add https://example.com/you/fast-fruit-drive.git --enable
-```
-
-Then click the fruit icon on the bar and toggle it on. Nautilus gets a sidebar
-bookmark named **iCloud Drive**.
+- Left click: panel
+- Right click: refresh
+- Middle click: open in Nautilus
+- In the panel: toggle the server, open Nautilus, sign in
+- Keys: `r` refresh, `o` open, `i` sign in, `p` / Enter on the switch to toggle
 
 Nautilus emblems (same idea as StratoSync):
 
@@ -53,10 +90,13 @@ Nautilus emblems (same idea as StratoSync):
 - checkmark — in the local cache and uploaded
 - document — listed from iCloud, not hydrated locally
 
-Refresh the folder (Ctrl+R) if an emblem looks stale. Restart Nautilus once
-after install (`nautilus -q`).
+Refresh the folder (Ctrl+R) if an emblem looks stale.
 
-## Settings (bar widget)
+## Configure
+
+```sh
+omarchy bar move io.github.abort-retry-ignore.ff-drive --section right
+```
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -68,33 +108,40 @@ after install (`nautilus -q`).
 Changing cache or read-only restarts the local WebDAV server. It never deletes
 or moves objects on iCloud.
 
-## Widget actions
-
-- Left click: panel
-- Right click: refresh
-- Middle click: open in Nautilus
-- In the panel: toggle the server, open Nautilus
-- Keys: `r` refresh, `o` open, `p` / Enter on the switch to toggle
-
-## CLI
-
 The widget shells out to `bin/fast-fruit-drive`:
 
-```bash
+```sh
 fast-fruit-drive status
 fast-fruit-drive start
 fast-fruit-drive stop
 fast-fruit-drive toggle
 fast-fruit-drive open
+fast-fruit-drive uninstall
 fast-fruit-drive configure read_only=true cache_max_size=4G cache_max_age=24h
 ```
 
 Config lives in `~/.config/fast-fruit-drive/config`. Cache lives in
 `~/.cache/fast-fruit-drive`. The user systemd unit is `fast-fruit-drive.service`.
 
+Starting the drive (explicit toggle or `start`) writes only:
+
+- the user systemd unit
+- a GTK bookmark named **iCloud Drive**
+- a Nautilus Python extension copy
+- this plugin's config file, if missing
+
 ## Safety
 
 - Read-only by default
 - No rclone purge/delete flags
 - Cache eviction is local only
-- Binds to `127.0.0.1` only
+- Binds to `127.0.0.1` / `::1` only
+- No sudo or pkexec
+- Does not overwrite `rclone.conf`
+
+## Development
+
+```sh
+omarchy plugin validate .
+qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Panel.qml Service.qml FruitIcon.qml
+```
