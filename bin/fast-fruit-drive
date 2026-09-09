@@ -210,6 +210,18 @@ cmd_serve() {
   exec "$rclone_bin" "${args[@]}"
 }
 
+wait_for_server() {
+  load_config
+  local i
+  for i in $(seq 1 40); do
+    if curl -sf --max-time 0.4 -o /dev/null -X OPTIONS "http://${addr}/" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.15
+  done
+  return 1
+}
+
 cmd_start() {
   cmd_ensure
   local rclone_bin
@@ -218,11 +230,8 @@ cmd_start() {
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured — run: rclone config"
   [[ -x /usr/lib/gvfsd-dav ]] || fail "Nautilus WebDAV is missing — install gvfs-dnssd"
   systemctl --user start "$UNIT"
-  for _ in $(seq 1 20); do
-    service_running && break
-    sleep 0.15
-  done
   service_running || fail "service failed to start — see: journalctl --user -u $UNIT"
+  wait_for_server || fail "WebDAV did not become ready on http://${addr}/"
   mount_dav
   ensure_bookmark
 }
@@ -235,7 +244,7 @@ cmd_stop() {
 cmd_restart() {
   cmd_ensure
   systemctl --user restart "$UNIT"
-  sleep 0.3
+  wait_for_server || fail "WebDAV did not become ready on http://${addr}/"
   mount_dav
   ensure_bookmark
 }
