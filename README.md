@@ -47,6 +47,15 @@ omarchy plugin add /path/to/fast-fruit-drive --enable
 Then click the fruit icon on the bar and toggle it on. Nautilus gets a sidebar
 bookmark named **iCloud Drive**.
 
+Nautilus emblems (same idea as StratoSync):
+
+- spinning arrows — still uploading (`Dirty` in the VFS cache)
+- checkmark — in the local cache and uploaded
+- document — listed from iCloud, not hydrated locally
+
+Refresh the folder (Ctrl+R) if an emblem looks stale. Restart Nautilus once
+after install (`nautilus -q`).
+
 ## Settings (bar widget)
 
 | Setting | Default | Meaning |

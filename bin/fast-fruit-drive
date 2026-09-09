@@ -5,6 +5,7 @@ set -euo pipefail
 APP=fast-fruit-drive
 UNIT=fast-fruit-drive.service
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PLUGIN_DIR=$(cd "$HERE/.." && pwd)
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
 CONFIG_FILE="$CONFIG_DIR/config"
@@ -236,11 +237,24 @@ cache_bytes() {
   fi
 }
 
+install_nautilus_extension() {
+  local src dest dir
+  src="$PLUGIN_DIR/nautilus/fast_fruit_drive_nautilus.py"
+  dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
+  dest="$dir/fast_fruit_drive_nautilus.py"
+  [[ -f $src ]] || return 0
+  mkdir -p "$dir"
+  if [[ ! -f $dest ]] || ! cmp -s "$src" "$dest"; then
+    cp -f "$src" "$dest"
+  fi
+}
+
 cmd_ensure() {
   load_config
   save_config
   write_unit
   ensure_bookmark
+  install_nautilus_extension
 }
 
 cmd_serve() {
