@@ -1,5 +1,4 @@
 import QtQuick
-import QtQuick.Shapes
 import qs.Commons
 
 // Whole apple outline — not Apple Inc's bitten-apple mark.
@@ -14,75 +13,53 @@ Item {
   implicitWidth: iconSize
   implicitHeight: iconSize
 
-  readonly property real w: width
-  readonly property real h: height
-  readonly property real stroke: Math.max(1.4, iconSize * 0.09)
-
-  Shape {
+  Canvas {
+    id: canvas
     anchors.fill: parent
     antialiasing: true
-    layer.enabled: true
-    layer.samples: 4
-    preferredRendererType: Shape.CurveRenderer
+    renderTarget: Canvas.Image
 
-    // Two-lobed crown, round belly, no bite. Inset so the stroke stays inside.
-    ShapePath {
-      fillColor: "transparent"
-      strokeColor: root.color
-      strokeWidth: root.stroke
-      capStyle: ShapePath.RoundCap
-      joinStyle: ShapePath.RoundJoin
-      startX: root.w * 0.50
-      startY: root.h * 0.34
-      PathCubic {
-        x: root.w * 0.88; y: root.h * 0.50
-        control1X: root.w * 0.72; control1Y: root.h * 0.16
-        control2X: root.w * 0.94; control2Y: root.h * 0.30
-      }
-      PathCubic {
-        x: root.w * 0.50; y: root.h * 0.90
-        control1X: root.w * 0.84; control1Y: root.h * 0.74
-        control2X: root.w * 0.68; control2Y: root.h * 0.90
-      }
-      PathCubic {
-        x: root.w * 0.12; y: root.h * 0.50
-        control1X: root.w * 0.32; control1Y: root.h * 0.90
-        control2X: root.w * 0.16; control2Y: root.h * 0.74
-      }
-      PathCubic {
-        x: root.w * 0.50; y: root.h * 0.34
-        control1X: root.w * 0.06; control1Y: root.h * 0.30
-        control2X: root.w * 0.28; control2Y: root.h * 0.16
-      }
-    }
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      var s = Math.min(width, height)
+      if (s < 2)
+        return
 
-    // Stem
-    ShapePath {
-      fillColor: "transparent"
-      strokeColor: root.color
-      strokeWidth: root.stroke
-      capStyle: ShapePath.RoundCap
-      startX: root.w * 0.50
-      startY: root.h * 0.10
-      PathLine {
-        x: root.w * 0.47
-        y: root.h * 0.32
-      }
-    }
+      var ox = (width - s) / 2
+      var oy = (height - s) / 2
+      function X(n) { return ox + s * n }
+      function Y(n) { return oy + s * n }
 
-    // Leaf as a single stroke so it stays hollow at bar size.
-    ShapePath {
-      fillColor: "transparent"
-      strokeColor: root.color
-      strokeWidth: root.stroke
-      capStyle: ShapePath.RoundCap
-      startX: root.w * 0.54
-      startY: root.h * 0.22
-      PathCubic {
-        x: root.w * 0.84; y: root.h * 0.08
-        control1X: root.w * 0.62; control1Y: root.h * 0.06
-        control2X: root.w * 0.74; control2Y: root.h * 0.00
-      }
+      ctx.strokeStyle = Qt.rgba(root.color.r, root.color.g, root.color.b, root.color.a)
+      ctx.lineWidth = Math.max(1, s * 0.07)
+      ctx.lineCap = "round"
+      ctx.lineJoin = "round"
+
+      // Two-lobed crown, round belly. Inset so the stroke stays inside.
+      ctx.beginPath()
+      ctx.moveTo(X(0.50), Y(0.30))
+      ctx.bezierCurveTo(X(0.70), Y(0.14), X(0.94), Y(0.30), X(0.88), Y(0.56))
+      ctx.bezierCurveTo(X(0.84), Y(0.80), X(0.66), Y(0.92), X(0.50), Y(0.92))
+      ctx.bezierCurveTo(X(0.34), Y(0.92), X(0.16), Y(0.80), X(0.12), Y(0.56))
+      ctx.bezierCurveTo(X(0.06), Y(0.30), X(0.30), Y(0.14), X(0.50), Y(0.30))
+      ctx.closePath()
+      ctx.stroke()
+
+      ctx.beginPath()
+      ctx.moveTo(X(0.50), Y(0.28))
+      ctx.quadraticCurveTo(X(0.47), Y(0.14), X(0.54), Y(0.07))
+      ctx.stroke()
+
+      ctx.beginPath()
+      ctx.moveTo(X(0.54), Y(0.20))
+      ctx.quadraticCurveTo(X(0.68), Y(0.08), X(0.82), Y(0.14))
+      ctx.stroke()
     }
   }
+
+  onColorChanged: canvas.requestPaint()
+  onWidthChanged: canvas.requestPaint()
+  onHeightChanged: canvas.requestPaint()
+  Component.onCompleted: canvas.requestPaint()
 }

@@ -12,7 +12,13 @@ License: MIT (see [LICENSE](LICENSE))
 
 ```sh
 omarchy plugin add https://github.com/abort-retry-ignore/ff-drive.git --enable
+omarchy pkg add gvfs-dnssd
 ```
+
+`gvfs-dnssd` is the Nautilus WebDAV backend (`/usr/lib/gvfsd-dav`). Adding a
+plugin does not install packages, so this is a separate Omarchy step.
+
+rclone must already be on `PATH` (or `~/.local/bin/rclone`).
 
 Then click the fruit icon on the bar and toggle it on. Nautilus gets a sidebar
 bookmark named **iCloud Drive**. Restart Nautilus once after the first start
@@ -44,12 +50,8 @@ session, not this plugin's. Packaged dependencies (`rclone`, `gvfs-dnssd`,
 
 - [Omarchy](https://omarchy.org/) with third-party shell plugins
 - [`rclone`](https://rclone.org/downloads/) on `PATH` (or `~/.local/bin/rclone`)
-- `gvfs-dnssd` (Nautilus WebDAV backend)
-- `nautilus-python` (emblems; optional)
-
-```sh
-omarchy pkg add gvfs-dnssd nautilus-python
-```
+- `gvfs-dnssd` (Nautilus WebDAV backend) — see [Install](#install)
+- `nautilus-python` (emblems; optional): `omarchy pkg add nautilus-python`
 
 Install rclone from your package manager or [rclone.org/downloads](https://rclone.org/downloads/).
 This plugin never downloads or executes remote installers.

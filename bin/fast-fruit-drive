@@ -313,6 +313,7 @@ cmd_start() {
 cmd_stop() {
   unmount_dav
   systemctl --user stop "$UNIT" 2>/dev/null || true
+  remove_bookmark
 }
 
 cmd_restart() {

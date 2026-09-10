@@ -93,7 +93,7 @@ Panel {
       Item {
         FruitIcon {
           anchors.centerIn: parent
-          iconSize: Style.space(12)
+          iconSize: parent.height
           color: root.barIconColor
           opacity: drive.active ? 1.0 : 0.6
         }
