@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Shapes
 import qs.Commons
 
+// Whole apple outline — not Apple Inc's bitten-apple mark.
 Item {
   id: root
 
@@ -13,66 +14,75 @@ Item {
   implicitWidth: iconSize
   implicitHeight: iconSize
 
+  readonly property real w: width
+  readonly property real h: height
+  readonly property real stroke: Math.max(1.4, iconSize * 0.09)
+
   Shape {
     anchors.fill: parent
     antialiasing: true
     layer.enabled: true
     layer.samples: 4
+    preferredRendererType: Shape.CurveRenderer
 
-    // Fruit body
+    // Two-lobed crown, round belly, no bite. Inset so the stroke stays inside.
     ShapePath {
-      fillColor: root.color
-      strokeWidth: 0
-      startX: root.width * 0.50
-      startY: root.height * 0.22
+      fillColor: "transparent"
+      strokeColor: root.color
+      strokeWidth: root.stroke
+      capStyle: ShapePath.RoundCap
+      joinStyle: ShapePath.RoundJoin
+      startX: root.w * 0.50
+      startY: root.h * 0.34
       PathCubic {
-        x: root.width * 0.90; y: root.height * 0.58
-        control1X: root.width * 0.86; control1Y: root.height * 0.22
-        control2X: root.width * 0.96; control2Y: root.height * 0.42
+        x: root.w * 0.88; y: root.h * 0.50
+        control1X: root.w * 0.72; control1Y: root.h * 0.16
+        control2X: root.w * 0.94; control2Y: root.h * 0.30
       }
       PathCubic {
-        x: root.width * 0.50; y: root.height * 0.96
-        control1X: root.width * 0.86; control1Y: root.height * 0.78
-        control2X: root.width * 0.68; control2Y: root.height * 0.96
+        x: root.w * 0.50; y: root.h * 0.90
+        control1X: root.w * 0.84; control1Y: root.h * 0.74
+        control2X: root.w * 0.68; control2Y: root.h * 0.90
       }
       PathCubic {
-        x: root.width * 0.10; y: root.height * 0.58
-        control1X: root.width * 0.32; control1Y: root.height * 0.96
-        control2X: root.width * 0.14; control2Y: root.height * 0.78
+        x: root.w * 0.12; y: root.h * 0.50
+        control1X: root.w * 0.32; control1Y: root.h * 0.90
+        control2X: root.w * 0.16; control2Y: root.h * 0.74
       }
       PathCubic {
-        x: root.width * 0.50; y: root.height * 0.22
-        control1X: root.width * 0.04; control1Y: root.height * 0.42
-        control2X: root.width * 0.14; control2Y: root.height * 0.22
+        x: root.w * 0.50; y: root.h * 0.34
+        control1X: root.w * 0.06; control1Y: root.h * 0.30
+        control2X: root.w * 0.28; control2Y: root.h * 0.16
       }
     }
 
-    // Leaf
+    // Stem
     ShapePath {
-      fillColor: root.color
-      strokeWidth: 0
-      startX: root.width * 0.52
-      startY: root.height * 0.18
-      PathCubic {
-        x: root.width * 0.82; y: root.height * 0.04
-        control1X: root.width * 0.58; control1Y: root.height * 0.02
-        control2X: root.width * 0.72; control2Y: root.height * -0.02
-      }
-      PathCubic {
-        x: root.width * 0.56; y: root.height * 0.26
-        control1X: root.width * 0.78; control1Y: root.height * 0.14
-        control2X: root.width * 0.64; control2Y: root.height * 0.24
+      fillColor: "transparent"
+      strokeColor: root.color
+      strokeWidth: root.stroke
+      capStyle: ShapePath.RoundCap
+      startX: root.w * 0.50
+      startY: root.h * 0.10
+      PathLine {
+        x: root.w * 0.47
+        y: root.h * 0.32
       }
     }
-  }
 
-  // Stem
-  Rectangle {
-    width: Math.max(1.5, root.width * 0.07)
-    height: root.height * 0.16
-    radius: width / 2
-    color: root.color
-    x: root.width * 0.50 - width / 2
-    y: root.height * 0.06
+    // Leaf as a single stroke so it stays hollow at bar size.
+    ShapePath {
+      fillColor: "transparent"
+      strokeColor: root.color
+      strokeWidth: root.stroke
+      capStyle: ShapePath.RoundCap
+      startX: root.w * 0.54
+      startY: root.h * 0.22
+      PathCubic {
+        x: root.w * 0.84; y: root.h * 0.08
+        control1X: root.w * 0.62; control1Y: root.h * 0.06
+        control2X: root.w * 0.74; control2Y: root.h * 0.00
+      }
+    }
   }
 }

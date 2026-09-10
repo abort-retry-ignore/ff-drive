@@ -20,26 +20,25 @@ bookmark named **iCloud Drive**. Restart Nautilus once after the first start
 
 ## Remove
 
-Stop the local WebDAV server and delete the files this plugin created, then
-remove the plugin. Do this **before** `omarchy plugin remove`, or the user
-systemd unit will still point at a deleted helper.
+Omarchy does not run plugin uninstall hooks, so wipe residuals **before**
+`omarchy plugin remove` or the user unit will point at a deleted helper.
 
 ```sh
 ~/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive/bin/fast-fruit-drive uninstall
 omarchy plugin remove io.github.abort-retry-ignore.ff-drive
 ```
 
-`uninstall` stops the service, disables and deletes
-`~/.config/systemd/user/fast-fruit-drive.service`, removes the **iCloud Drive**
-GTK bookmark this plugin added, and removes the Nautilus emblem extension.
-It does **not** touch `~/.config/rclone/rclone.conf`, this plugin's own config,
-or the local cache.
+`uninstall` stops WebDAV, then deletes:
 
-Optional leftovers:
+- `~/.config/systemd/user/fast-fruit-drive.service`
+- `~/.config/fast-fruit-drive/` (plugin config)
+- `~/.cache/fast-fruit-drive/` (hydrated file cache)
+- the **iCloud Drive** GTK bookmark this plugin added
+- the Nautilus emblem extension (and its `*.pyc`)
 
-```sh
-rm -rf ~/.config/fast-fruit-drive ~/.cache/fast-fruit-drive
-```
+It does **not** modify `~/.config/rclone/rclone.conf` — that is rclone's Apple
+session, not this plugin's. Packaged dependencies (`rclone`, `gvfs-dnssd`,
+`nautilus-python`) stay installed.
 
 ## Requirements
 

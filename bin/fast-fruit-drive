@@ -38,7 +38,7 @@ Commands:
   serve                          Exec rclone (systemd ExecStart)
   ensure                         Write unit, config, and Nautilus bookmark
   configure KEY=VAL [...]        Update config; add restart=1 to bounce rclone
-  uninstall                      Stop the service and remove unit, bookmark, emblems
+  uninstall                      Stop and delete unit, bookmark, emblems, config, cache
   help                           Show this help
 EOF
 }
@@ -418,9 +418,15 @@ cmd_configure() {
 }
 
 remove_bookmark() {
-  load_config
-  local tmp line
+  local tmp line port
   [[ -f $BOOKMARKS ]] || return 0
+  if [[ -f $CONFIG_FILE ]]; then
+    load_config
+  else
+    port=${DEFAULT_BIND##*:}
+    dav_uri="dav://${DEFAULT_DAV_HOST}:${port}/"
+    old_uri="dav://127.0.0.1:${port}/"
+  fi
   tmp=$(mktemp)
   while IFS= read -r line || [[ -n $line ]]; do
     if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
@@ -432,16 +438,23 @@ remove_bookmark() {
 }
 
 remove_nautilus_extension() {
-  rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions/fast_fruit_drive_nautilus.py"
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
+  rm -f "$dir/fast_fruit_drive_nautilus.py"
+  rm -f "$dir/__pycache__/fast_fruit_drive_nautilus"*.pyc
 }
 
 cmd_uninstall() {
   cmd_stop
   systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
   rm -f "$UNIT_FILE"
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants/$UNIT"
+  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
   systemctl --user daemon-reload >/dev/null 2>&1 || true
   remove_bookmark
   remove_nautilus_extension
+  rm -rf "$CONFIG_DIR" "$CACHE_DIR"
+  echo "$APP: removed unit, bookmark, emblems, $CONFIG_DIR, and $CACHE_DIR"
+  echo "$APP: left ~/.config/rclone/rclone.conf untouched (Apple session is rclone's)"
 }
 
 cmd_status() {
