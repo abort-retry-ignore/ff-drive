@@ -1,14 +1,13 @@
 # Fast Fruit Drive
 
-Fast Apple iCloud Drive integration with Omarchy. Does not mount the drive locally (which is slow), it's only visible as a remote drive in Nautilus file manager (Super-Shift-F).
-
-Even faster than the browser version of iCloud!
-
-Suitable for large iCloud Drives. Listings stay in the cloud; only files you open are cached on disk.  Cache location:  ~/.cache/fast-fruit-drive/ 
-
-Includes Bar widget that serves **iCloud Drive** to Nautilus over local rclone WebDAV.
+Fast Apple iCloud Drive integration with Omarchy.
 
 ![Fast Fruit Drive bar widget](preview.png)
+
+- Does not mount the drive locally (which is slow) — it's only visible as a remote drive in Nautilus file manager (Super-Shift-F)
+- Even faster than the browser version of iCloud!
+- Suitable for large iCloud Drives — listings stay in the cloud; only files you open are cached on disk (`~/.cache/fast-fruit-drive/`)
+- Includes a bar widget that serves **iCloud Drive** to Nautilus over local rclone WebDAV
 
 Plugin id: `io.github.abort-retry-ignore.ff-drive`  
 License: MIT (see [LICENSE](LICENSE))
