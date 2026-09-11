@@ -469,8 +469,8 @@ Panel {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: root.clearArmed
-                  ? "Interrupts transfers, discards files still uploading"
-                  : Model.cacheText(drive.cacheUsedBytes, drive.cacheMaxSize) + " — files re-download when opened"
+                  ? "Interrupts transfers, discards pending uploads"
+                  : Model.cacheText(drive.cacheUsedBytes, drive.cacheMaxSize)
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
