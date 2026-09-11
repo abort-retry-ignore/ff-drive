@@ -122,6 +122,8 @@ Item {
     runControl(["configure", "read_only=" + (on ? "true" : "false"), "restart=1"])
   }
 
+  function clearCache() { runControl(["clear-cache"]) }
+
   function applySettings() {
     var key = configKey()
     if (key === _appliedKey) return
@@ -208,7 +210,9 @@ Item {
         actionStatusTimer.restart()
       } else {
         root.lastError = ""
-        root.actionStatus = ""
+        var note = root.elideStatus(stdout)
+        root.actionStatus = note
+        if (note !== "") actionStatusTimer.restart()
       }
       settleTimer.ticks = 0
       settleTimer.restart()

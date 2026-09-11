@@ -38,6 +38,7 @@ Commands:
   serve                          Exec rclone (systemd ExecStart)
   ensure                         Write unit, config, and Nautilus bookmark
   configure KEY=VAL [...]        Update config; add restart=1 to bounce rclone
+  clear-cache                    Bounce rclone and wipe the local file cache
   uninstall                      Stop and delete unit, bookmark, emblems, config, cache
   help                           Show this help
 EOF
@@ -418,6 +419,26 @@ cmd_configure() {
   fi
 }
 
+cmd_clear_cache() {
+  # Safe, near-instant cache wipe: rclone only reconciles its in-memory VFS
+  # index at startup, so the file cache cannot be purged while it runs. Stop
+  # the unit, wipe, start, and skip the slow parts (gio mount, bookmark, unit
+  # rewrite) — WebDAV is stateless, gio reconnects on its own.
+  local was_running=false freed
+  freed=$(cache_bytes)
+  service_running && was_running=true
+  if [[ $was_running == true ]]; then
+    systemctl --user stop "$UNIT" || fail "could not stop $UNIT"
+  fi
+  rm -rf "$CACHE_DIR"
+  mkdir -p "$CACHE_DIR"
+  if [[ $was_running == true ]]; then
+    systemctl --user start "$UNIT" || fail "could not start $UNIT"
+    wait_for_server || fail "WebDAV did not come back — see: journalctl --user -u $UNIT"
+  fi
+  echo "Cache cleared: $(numfmt --to=iec "$freed") freed from $CACHE_DIR"
+}
+
 remove_bookmark() {
   local tmp line port
   [[ -f $BOOKMARKS ]] || return 0
@@ -553,6 +574,7 @@ case $cmd in
   serve) cmd_serve ;;
   ensure) cmd_ensure ;;
   configure) cmd_configure "$@" ;;
+  clear-cache) cmd_clear_cache ;;
   uninstall) cmd_uninstall ;;
   help|-h|--help) usage ;;
   *) fail "unknown command: $cmd" ;;
