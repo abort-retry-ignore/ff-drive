@@ -1,9 +1,15 @@
 # Fast Fruit Drive
 
-Omarchy bar widget that serves **iCloud Drive** to Nautilus over local rclone
-WebDAV. Listings stay in the cloud; only files you open are cached on disk.
+Fast Apple iCloud Drive integration with Omarchy. Does not mount the drive locally (which is slow), it's only visible as a remote drive in Nautilus file manager (Super-Shift-F).
 
-Nautilus shows it as **iCloud Drive**, not `127.0.0.1:8080`.
+Even faster than the browser version of iCloud!
+
+Suitable for large iCloud Drives. Listings stay in the cloud; only files you open are cached on disk.  Cache location:  ~/.cache/fast-fruit-drive/ 
+
+Includes Bar widget that serves **iCloud Drive** to Nautilus over local rclone
+WebDAV. Read only mode toggle on widget.
+
+![Fast Fruit Drive bar widget](preview.png)
 
 Plugin id: `io.github.abort-retry-ignore.ff-drive`  
 License: MIT (see [LICENSE](LICENSE))
@@ -11,41 +17,18 @@ License: MIT (see [LICENSE](LICENSE))
 ## Install
 
 ```sh
+omarchy pkg add gvfs-dnssd rclone
 omarchy plugin add https://github.com/abort-retry-ignore/ff-drive.git --enable
-omarchy pkg add gvfs-dnssd
 ```
-
-`gvfs-dnssd` is the Nautilus WebDAV backend (`/usr/lib/gvfsd-dav`). Adding a
-plugin does not install packages, so this is a separate Omarchy step.
-
-rclone must already be on `PATH` (or `~/.local/bin/rclone`).
-
 Then click the fruit icon on the bar and toggle it on. Nautilus gets a sidebar
-bookmark named **iCloud Drive**. Restart Nautilus once after the first start
-(`nautilus -q`) so emblems load.
+bookmark named **iCloud Drive**. 
 
 ## Remove
-
-Omarchy does not run plugin uninstall hooks, so wipe residuals **before**
-`omarchy plugin remove` or the user unit will point at a deleted helper.
 
 ```sh
 ~/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive/bin/fast-fruit-drive uninstall
 omarchy plugin remove io.github.abort-retry-ignore.ff-drive
 ```
-
-`uninstall` stops WebDAV, then deletes:
-
-- `~/.config/systemd/user/fast-fruit-drive.service`
-- `~/.config/fast-fruit-drive/` (plugin config)
-- `~/.cache/fast-fruit-drive/` (hydrated file cache)
-- the **iCloud Drive** GTK bookmark this plugin added
-- the Nautilus emblem extension (and its `*.pyc`)
-
-It does **not** modify `~/.config/rclone/rclone.conf` — that is rclone's Apple
-session, not this plugin's. Packaged dependencies (`rclone`, `gvfs-dnssd`,
-`nautilus-python`) stay installed.
-
 ## Requirements
 
 - [Omarchy](https://omarchy.org/) with third-party shell plugins
@@ -65,8 +48,7 @@ if the remote does not exist yet).
 - Use your real Apple ID password and 2FA. App-specific passwords are rejected.
 - rclone stores `trust_token` / `cookies` in `~/.config/rclone/rclone.conf`.
 - That trust token lasts **about 30 days**. After it expires, Sign in again.
-- Fast Fruit Drive never copies or replaces that file; it only reads whether a
-  session exists.
+- Fast Fruit Drive never copies or replaces that file; it only reads whether a session exists.
 
 ## Why
 
@@ -133,7 +115,7 @@ Starting the drive (explicit toggle or `start`) writes only:
 
 ## Safety
 
-- Read-only by default
+- Read-only configurable
 - No rclone purge/delete flags
 - Cache eviction is local only
 - Binds to `127.0.0.1` / `::1` only
