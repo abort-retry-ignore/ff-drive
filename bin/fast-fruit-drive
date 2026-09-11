@@ -259,7 +259,7 @@ require_packages() {
     echo "$APP: required packages missing. Run: omarchy pkg add gvfs-dnssd rclone"
     [[ $need_rclone == true ]] && echo "  - rclone — serves iCloud over WebDAV (or a binary from rclone.org)"
     [[ $need_gvfs == true ]] && echo "  - gvfs-dnssd — the Nautilus WebDAV backend"
-    echo "Then toggle Fruit Drive on again."
+    echo "Then toggle Fast Fruit Drive on again."
   } >&2
   exit 1
 }
@@ -391,7 +391,7 @@ cmd_login_tui() {
     "$rclone_bin" config
   fi
   echo
-  echo "Done. You can close this terminal. Toggle Fruit Drive on from the bar."
+  echo "Done. You can close this terminal. Toggle Fast Fruit Drive on from the bar."
   echo
 }
 

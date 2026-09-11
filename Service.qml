@@ -183,7 +183,7 @@ Item {
       var stdout = String(statusStdout.text || root._statusOutput || "")
       var stderr = String(statusStderr.text || root._statusError || "")
       if (exitCode === 0) root.applyStatus(stdout)
-      else root.lastError = root.elideStatus(stderr || stdout || "Could not read Fruit Drive status")
+      else root.lastError = root.elideStatus(stderr || stdout || "Could not read Fast Fruit Drive status")
     }
   }
 
@@ -198,7 +198,7 @@ Item {
       var stderr = String(controlStderr.text || root._controlError || "")
       if (exitCode !== 0) {
         root._desired = -1
-        root.lastError = root.elideStatus(stderr || stdout || "Fruit Drive command failed")
+        root.lastError = root.elideStatus(stderr || stdout || "Fast Fruit Drive command failed")
         root.actionStatus = root.lastError
         actionStatusTimer.restart()
       } else {

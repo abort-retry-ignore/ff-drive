@@ -181,7 +181,7 @@ Panel {
           PanelHero {
             id: hero
             width: parent.width
-            title: "Fruit Drive"
+            title: "Fast Fruit Drive"
             meta: drive.statusText
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -240,7 +240,7 @@ Panel {
               if (!drive.rcloneFound) return "Install rclone and put it on PATH."
               if (drive.needsLogin) return "Sign in with your Apple ID password and 2FA. rclone keeps a trust token for about 30 days, then you sign in again. App-specific passwords are not accepted."
               if (!drive.gvfsDav) return "Install gvfs-dnssd so Nautilus can speak WebDAV."
-              return "Fruit Drive is not ready yet."
+              return "Fast Fruit Drive is not ready yet."
             }
           }
         }
