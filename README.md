@@ -2,7 +2,7 @@
 
 Fast Apple iCloud Drive integration with Omarchy.
 
-![Fast Fruit Drive bar widget](preview.png)
+<img src="preview.png" alt="Fast Fruit Drive bar widget" width="338">
 
 - Does not mount the drive locally (which is slow) — it's only visible as a remote drive in Nautilus file manager (Super-Shift-F)
 - Even faster than the browser version of iCloud!
