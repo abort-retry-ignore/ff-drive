@@ -16,7 +16,6 @@ RCLONE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/rclone/rclone.conf"
 DEFAULT_REMOTE="icloud:"
 DEFAULT_BIND="127.0.0.1:8080"
 DEFAULT_DAV_HOST="iCloud.localhost"
-DEFAULT_READ_ONLY="true"
 DEFAULT_CACHE_MAX_SIZE="4G"
 DEFAULT_CACHE_MAX_AGE="24h"
 DEFAULT_DISPLAY_NAME="iCloud Drive"
@@ -67,7 +66,6 @@ save_config() {
 remote=$remote
 bind=$bind
 dav_host=$dav_host
-read_only=$read_only
 cache_max_size=$cache_max_size
 cache_max_age=$cache_max_age
 display_name=$display_name
@@ -81,7 +79,6 @@ write_default_config() {
     remote=$DEFAULT_REMOTE
     bind=$DEFAULT_BIND
     dav_host=$DEFAULT_DAV_HOST
-    read_only=$DEFAULT_READ_ONLY
     cache_max_size=$DEFAULT_CACHE_MAX_SIZE
     cache_max_age=$DEFAULT_CACHE_MAX_AGE
     display_name=$DEFAULT_DISPLAY_NAME
@@ -95,7 +92,6 @@ load_config() {
   remote=$DEFAULT_REMOTE
   bind=$DEFAULT_BIND
   dav_host=$DEFAULT_DAV_HOST
-  read_only=$DEFAULT_READ_ONLY
   cache_max_size=$DEFAULT_CACHE_MAX_SIZE
   cache_max_age=$DEFAULT_CACHE_MAX_AGE
   display_name=$DEFAULT_DISPLAY_NAME
@@ -112,7 +108,6 @@ load_config() {
         dav_host=$DEFAULT_DAV_HOST
         ;;
       dav_host) dav_host=$value ;;
-      read_only) read_only=$(bool "$value") ;;
       cache_max_size) cache_max_size=$value ;;
       cache_max_age) cache_max_age=$value ;;
       display_name) display_name=$value ;;
@@ -251,7 +246,26 @@ install_nautilus_extension() {
   fi
 }
 
+# Abort before writing anything unless every required package is present.
+# The fix command leads the message so the widget's one-line error stays useful.
+require_packages() {
+  local need_rclone=false need_gvfs=false
+  [[ -n $(find_rclone) ]] || need_rclone=true
+  [[ -x /usr/lib/gvfsd-dav ]] || need_gvfs=true
+  if [[ $need_rclone == false && $need_gvfs == false ]]; then
+    return 0
+  fi
+  {
+    echo "$APP: required packages missing. Run: omarchy pkg add gvfs-dnssd rclone"
+    [[ $need_rclone == true ]] && echo "  - rclone — serves iCloud over WebDAV (or a binary from rclone.org)"
+    [[ $need_gvfs == true ]] && echo "  - gvfs-dnssd — the Nautilus WebDAV backend"
+    echo "Then toggle Fruit Drive on again."
+  } >&2
+  exit 1
+}
+
 cmd_ensure() {
+  require_packages
   load_config
   save_config
   write_unit
@@ -278,9 +292,6 @@ cmd_serve() {
     --dir-cache-time 30s
     --cache-dir "$CACHE_DIR"
   )
-  if [[ $read_only == true ]]; then
-    args+=(--read-only)
-  fi
   exec "$rclone_bin" "${args[@]}"
 }
 
@@ -300,10 +311,8 @@ cmd_start() {
   cmd_ensure
   local rclone_bin
   rclone_bin=$(find_rclone)
-  [[ -n $rclone_bin ]] || fail "rclone not found (install rclone and put it on PATH)"
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured — use Sign in on the widget"
   session_present || fail "iCloud session missing or expired — use Sign in on the widget"
-  [[ -x /usr/lib/gvfsd-dav ]] || fail "Nautilus WebDAV is missing — install gvfs-dnssd"
   systemctl --user start "$UNIT"
   service_running || fail "service failed to start — see: journalctl --user -u $UNIT"
   wait_for_server || fail "WebDAV did not become ready on http://${bind}/"
@@ -394,7 +403,6 @@ cmd_configure() {
     key=${pair%%=*}
     value=${pair#*=}
     case $key in
-      read_only) value=$(bool "$value"); [[ $value == "$read_only" ]] || changed=true; read_only=$value ;;
       cache_max_size) [[ $value == "$cache_max_size" ]] || changed=true; cache_max_size=$value ;;
       cache_max_age) [[ $value == "$cache_max_age" ]] || changed=true; cache_max_age=$value ;;
       cache_max_age_hours)
@@ -520,7 +528,6 @@ cmd_status() {
     --argjson ready "$ready" \
     --argjson running "$running" \
     --argjson mounted "$mounted" \
-    --argjson readOnly "$read_only" \
     --argjson rcloneFound "$rclone_found" \
     --argjson remoteConfigured "$configured" \
     --argjson hasSession "$has_session" \
@@ -541,7 +548,6 @@ cmd_status() {
       ready: $ready,
       running: $running,
       mounted: $mounted,
-      readOnly: $readOnly,
       rcloneFound: $rcloneFound,
       remoteConfigured: $remoteConfigured,
       hasSession: $hasSession,

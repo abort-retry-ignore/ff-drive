@@ -6,8 +6,7 @@ Even faster than the browser version of iCloud!
 
 Suitable for large iCloud Drives. Listings stay in the cloud; only files you open are cached on disk.  Cache location:  ~/.cache/fast-fruit-drive/ 
 
-Includes Bar widget that serves **iCloud Drive** to Nautilus over local rclone
-WebDAV. Read only mode toggle on widget.
+Includes Bar widget that serves **iCloud Drive** to Nautilus over local rclone WebDAV.
 
 ![Fast Fruit Drive bar widget](preview.png)
 
@@ -83,13 +82,11 @@ omarchy bar move io.github.abort-retry-ignore.ff-drive --section right
 
 | Setting | Default | Meaning |
 |---|---|---|
-| Read-only | On | Nautilus cannot delete/move/overwrite iCloud files |
 | Local cache size | 4G | Cap for files you actually open |
 | Cache max age | 24h | Unused cache entries are dropped |
 | Refresh interval | 15s | How often the widget polls status |
 
-Changing cache or read-only restarts the local WebDAV server. It never deletes
-or moves objects on iCloud.
+Changing cache settings restarts the local WebDAV server.
 
 The widget shells out to `bin/fast-fruit-drive`:
 
@@ -100,7 +97,7 @@ fast-fruit-drive stop
 fast-fruit-drive toggle
 fast-fruit-drive open
 fast-fruit-drive uninstall
-fast-fruit-drive configure read_only=true cache_max_size=4G cache_max_age=24h
+fast-fruit-drive configure cache_max_size=4G cache_max_age=24h
 ```
 
 Config lives in `~/.config/fast-fruit-drive/config`. Cache lives in
@@ -115,7 +112,6 @@ Starting the drive (explicit toggle or `start`) writes only:
 
 ## Safety
 
-- Read-only configurable
 - No rclone purge/delete flags
 - Cache eviction is local only
 - Binds to `127.0.0.1` / `::1` only

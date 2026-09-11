@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Igor Divjak",
   "license": "MIT",
-  "description": "On-demand iCloud Drive in Nautilus via rclone WebDAV. Browse fast, cache only what you open, read-only by default.",
+  "description": "On-demand iCloud Drive in Nautilus via rclone WebDAV. Browse fast, cache only what you open.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Fast Fruit Drive",
-    "description": "Start iCloud Drive in Nautilus, toggle read-only, and cap the local cache.",
+    "description": "Start iCloud Drive in Nautilus and cap the local cache.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right",

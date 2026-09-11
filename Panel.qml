@@ -315,34 +315,6 @@ Panel {
           InfoPair { label: "Remote"; value: drive.remote }
         }
 
-        Item {
-          visible: drive.ready
-          width: parent.width
-          implicitHeight: roRow.implicitHeight
-
-          RowLayout {
-            id: roRow
-            width: parent.width
-            spacing: Style.space(8)
-            Text {
-              textFormat: Text.PlainText
-              text: "Read-only"
-              color: root.foreground
-              opacity: 0.6
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              Layout.fillWidth: true
-            }
-            ToggleSwitch {
-              id: roSwitch
-              checked: drive.readOnly
-              busy: drive.busy
-              foreground: root.foreground
-              onToggled: drive.setReadOnly(!drive.readOnly)
-            }
-          }
-        }
-
         PanelSeparator {
           visible: drive.ready
           foreground: root.foreground

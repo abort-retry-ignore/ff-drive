@@ -17,7 +17,6 @@ function defaultStatus(error) {
     ready: false,
     running: false,
     mounted: false,
-    readOnly: true,
     rcloneFound: false,
     remoteConfigured: false,
     hasSession: false,
@@ -51,8 +50,4 @@ function formatBytes(bytes) {
 
 function cacheText(usedBytes, maxSize) {
   return formatBytes(usedBytes) + " / " + String(maxSize || "?")
-}
-
-function modeText(readOnly) {
-  return readOnly ? "Read-only" : "Read & write"
 }

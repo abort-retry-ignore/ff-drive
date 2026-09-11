@@ -12,7 +12,6 @@ Item {
   property bool ready: false
   property bool running: false
   property bool mounted: false
-  property bool readOnly: true
   property bool rcloneFound: false
   property bool remoteConfigured: false
   property bool hasSession: false
@@ -33,7 +32,6 @@ Item {
   readonly property bool active: _desired === -1 ? running : (_desired === 1)
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
-  readonly property string settingReadOnly: String(setting("readOnly", "On"))
   readonly property string settingCacheMaxSize: String(setting("cacheMaxSize", "4G"))
   readonly property int settingCacheMaxAgeHours: intSetting("cacheMaxAgeHours", 24, 1, 168)
   readonly property bool busy: statusProcess.running || controlProcess.running
@@ -65,7 +63,7 @@ Item {
   }
 
   function configKey() {
-    return settingReadOnly + "|" + settingCacheMaxSize + "|" + settingCacheMaxAgeHours
+    return settingCacheMaxSize + "|" + settingCacheMaxAgeHours
   }
 
   function refresh() {
@@ -82,7 +80,6 @@ Item {
     ready = parsed.ready === true
     running = parsed.running === true
     mounted = parsed.mounted === true
-    readOnly = parsed.readOnly !== false
     rcloneFound = parsed.rcloneFound === true
     remoteConfigured = parsed.remoteConfigured === true
     hasSession = parsed.hasSession === true
@@ -118,10 +115,6 @@ Item {
   function toggleRunning() { active ? stop() : start() }
   function openDrive() { runControl(["open"]) }
   function login() { runControl(["login"]) }
-  function setReadOnly(on) {
-    runControl(["configure", "read_only=" + (on ? "true" : "false"), "restart=1"])
-  }
-
   function clearCache() { runControl(["clear-cache"]) }
 
   function applySettings() {
