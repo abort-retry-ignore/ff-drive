@@ -347,11 +347,10 @@ cmd_open() {
   service_running || cmd_start
   mount_dav
   ensure_bookmark
-  if command -v uwsm-app >/dev/null 2>&1; then
-    uwsm-app -- nautilus "$dav_uri" >/dev/null 2>&1 &
-  else
-    nautilus "$dav_uri" >/dev/null 2>&1 &
-  fi
+  # Direct spawn: the helper inherits the full session environment, and
+  # uwsm-app serializes launches through a FIFO daemon whose cold start
+  # (early login, hung daemon) can block for seconds before the window appears.
+  nautilus "$dav_uri" >/dev/null 2>&1 &
 }
 
 cmd_login() {
