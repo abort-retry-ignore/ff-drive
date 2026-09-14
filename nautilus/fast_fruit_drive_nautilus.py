@@ -46,18 +46,21 @@ def _load_config() -> dict:
         return _cfg
     out = {"cache": DEFAULT_CACHE, "remote": DEFAULT_REMOTE, "dav_host": "icloud.localhost"}
     try:
-        with open(CONFIG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                if key == "cache_dir":
-                    out["cache"] = os.path.expanduser(value)
-                elif key == "remote":
-                    out["remote"] = value.rstrip(":").split("/")[0]
-                elif key == "dav_host":
-                    out["dav_host"] = value.lower()
+        with open(CONFIG, encoding="utf-8", errors="replace") as fh:
+            blob = fh.read(65537)
+        if len(blob) > 65536:
+            blob = ""
+        for line in blob.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key == "cache_dir":
+                out["cache"] = os.path.expanduser(value)
+            elif key == "remote":
+                out["remote"] = value.rstrip(":").split("/")[0]
+            elif key == "dav_host":
+                out["dav_host"] = value.lower()
     except OSError:
         pass
     hosts = set(DAV_HOSTS)
@@ -116,7 +119,10 @@ def _read_one(rel: str) -> str:
     vfs_path = os.path.join(cfg["vfs_root"], rel) if rel else cfg["vfs_root"]
     if rel and os.path.isfile(meta_path):
         try:
-            with open(meta_path, encoding="utf-8") as fh:
+            if os.path.getsize(meta_path) > 262144:
+                # Bounded reads: oversized metadata is never parsed.
+                return "cached"
+            with open(meta_path, encoding="utf-8", errors="replace") as fh:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError):
             data = {}

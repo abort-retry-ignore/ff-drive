@@ -42,6 +42,32 @@ Item {
   property string _controlOutput: ""
   property string _controlError: ""
   property string _appliedKey: ""
+  property bool _statusOverflow: false
+  property bool _controlOverflow: false
+
+  // Live byte ceiling for helper output; the status JSON is ~500 B, so this
+  // only ever trips when something is very wrong.
+  readonly property int outputCap: 65536
+
+  function collectStatusOut(line) {
+    if (_statusOutput.length > outputCap) { _statusOverflow = true; return }
+    _statusOutput += line + "\n"
+  }
+
+  function collectStatusErr(line) {
+    if (_statusError.length > outputCap) { _statusOverflow = true; return }
+    _statusError += line + "\n"
+  }
+
+  function collectControlOut(line) {
+    if (_controlOutput.length > outputCap) { _controlOverflow = true; return }
+    _controlOutput += line + "\n"
+  }
+
+  function collectControlErr(line) {
+    if (_controlError.length > outputCap) { _controlOverflow = true; return }
+    _controlError += line + "\n"
+  }
 
   function helperFromUrl(url) {
     var value = String(url || "")
@@ -70,6 +96,7 @@ Item {
     if (statusProcess.running) return
     _statusOutput = ""
     _statusError = ""
+    _statusOverflow = false
     refreshing = true
     statusProcess.command = [helperPath, "status"]
     statusProcess.running = true
@@ -106,6 +133,7 @@ Item {
     if (desired !== undefined) _desired = desired
     _controlOutput = ""
     _controlError = ""
+    _controlOverflow = false
     controlProcess.command = [helperPath].concat(args)
     controlProcess.running = true
   }
@@ -156,6 +184,33 @@ Item {
   }
 
   Timer {
+    id: statusWatchdog
+    interval: 15000
+    repeat: false
+    running: statusProcess.running
+    onTriggered: {
+      statusProcess.running = false
+      root.refreshing = false
+      root.lastError = "Fast Fruit Drive status timed out"
+    }
+  }
+
+  Timer {
+    id: controlWatchdog
+    interval: 45000
+    repeat: false
+    running: controlProcess.running
+    onTriggered: {
+      controlProcess.running = false
+      root._desired = -1
+      root.lastError = "Fast Fruit Drive command timed out"
+      root.actionStatus = root.lastError
+      actionStatusTimer.restart()
+      delayedRefresh.restart()
+    }
+  }
+
+  Timer {
     id: settleTimer
     property int ticks: 0
     interval: 700
@@ -176,14 +231,17 @@ Item {
     id: statusProcess
     running: false
     command: []
-    stdout: StdioCollector { id: statusStdout; waitForEnd: true; onStreamFinished: root._statusOutput = text }
-    stderr: StdioCollector { id: statusStderr; waitForEnd: true; onStreamFinished: root._statusError = text }
+    stdout: SplitParser { onRead: function(line) { root.collectStatusOut(line) } }
+    stderr: SplitParser { onRead: function(line) { root.collectStatusErr(line) } }
     onExited: function(exitCode) {
       root.refreshing = false
-      var stdout = String(statusStdout.text || root._statusOutput || "")
-      var stderr = String(statusStderr.text || root._statusError || "")
-      if (exitCode === 0) root.applyStatus(stdout)
-      else root.lastError = root.elideStatus(stderr || stdout || "Could not read Fast Fruit Drive status")
+      if (root._statusOverflow) {
+        root._statusOverflow = false
+        root.lastError = "Fast Fruit Drive status output exceeded safety limit"
+        return
+      }
+      if (exitCode === 0) root.applyStatus(_statusOutput)
+      else root.lastError = root.elideStatus(_statusError || _statusOutput || "Could not read Fast Fruit Drive status")
     }
   }
 
@@ -191,11 +249,22 @@ Item {
     id: controlProcess
     running: false
     command: []
-    stdout: StdioCollector { id: controlStdout; waitForEnd: true; onStreamFinished: root._controlOutput = text }
-    stderr: StdioCollector { id: controlStderr; waitForEnd: true; onStreamFinished: root._controlError = text }
+    stdout: SplitParser { onRead: function(line) { root.collectControlOut(line) } }
+    stderr: SplitParser { onRead: function(line) { root.collectControlErr(line) } }
     onExited: function(exitCode) {
-      var stdout = String(controlStdout.text || root._controlOutput || "")
-      var stderr = String(controlStderr.text || root._controlError || "")
+      if (root._controlOverflow) {
+        root._controlOverflow = false
+        root._desired = -1
+        root.lastError = "Fast Fruit Drive command output exceeded safety limit"
+        root.actionStatus = root.lastError
+        actionStatusTimer.restart()
+        settleTimer.ticks = 0
+        settleTimer.restart()
+        delayedRefresh.restart()
+        return
+      }
+      var stdout = root._controlOutput
+      var stderr = root._controlError
       if (exitCode !== 0) {
         root._desired = -1
         root.lastError = root.elideStatus(stderr || stdout || "Fast Fruit Drive command failed")
