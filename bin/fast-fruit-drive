@@ -1,6 +1,13 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
 set -euo pipefail
+
+# Closed environment: every tool resolves from root-owned standard
+# directories; user-writable PATH entries are never consulted.
+PATH=/usr/local/bin:/usr/bin
+export PATH
+
+readonly USER_UID=$EUID
 
 APP=fast-fruit-drive
 UNIT=fast-fruit-drive.service
@@ -56,13 +63,117 @@ bool() {
   esac
 }
 
+# ---- Safety primitives -------------------------------------------------
+
+# Every component of path (checked no-follow: symlinks rejected) must be a
+# real directory owned by this user or root and not group/world-writable.
+safe_dir() {
+  local path="$1" cur="" part owner mode
+  [[ $path == /* ]] || return 1
+  [[ $path == "/" ]] && return 0
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for part in "${parts[@]}"; do
+    [[ -n $part ]] || continue
+    cur="$cur/$part"
+    [[ ! -L $cur && -d $cur ]] || return 1
+    owner=$(stat -c '%u' "$cur")
+    mode=$(stat -c '%a' "$cur")
+    [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
+    [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
+  done
+  return 0
+}
+
+# Leaf file: regular file, not a symlink, owned by this user or root.
+safe_file() {
+  local path="$1" owner
+  [[ -f $path && ! -L $path ]] || return 1
+  owner=$(stat -c '%u' "$path")
+  [[ $owner == "$USER_UID" || $owner == 0 ]]
+}
+
+# Executable accepted only at a root-owned, symlink-free location whose
+# ancestors are all root-owned and not group/world-writable, so nothing in
+# user-writable space can shadow what the long-lived service runs.
+safe_exec() {
+  local path="$1" dir owner mode
+  [[ $path == /* ]] || return 1
+  [[ -f $path && ! -L $path && -x $path ]] || return 1
+  owner=$(stat -c '%u' "$path")
+  mode=$(stat -c '%a' "$path")
+  [[ $owner == 0 ]] || return 1
+  [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
+  dir=${path%/*}
+  safe_dir "$dir" || return 1
+  return 0
+}
+
+# Recursive delete only when every component is a real user-or-root-owned
+# directory (no symlinks anywhere) and the resolved path stays under the
+# resolved home directory — a planted symlink is refused, not followed.
+safe_rm_rf() {
+  local path="$1" real_home real_path
+  [[ -e $path ]] || return 0
+  real_home=$(realpath "$HOME")
+  real_path=$(realpath "$path") || return 1
+  [[ $real_path == "$real_home" || $real_path == "$real_home"/* ]] || return 1
+  [[ $real_path == "$path" ]] || return 1
+  safe_dir "$path" || return 1
+  rm -rf -- "$real_path"
+}
+
+# ---- Config value schemas ----------------------------------------------
+
+valid_bind() {
+  local value="$1" host port
+  [[ $value == *:* ]] || return 1
+  port=${value##*:}
+  host=${value%:$port}
+  [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
+  [[ 10#$port -ge 1 && 10#$port -le 65535 ]] || return 1
+  [[ $host == "127.0.0.1" || $host == "[::1]" ]]
+}
+
+valid_remote_name() {
+  [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ && $1 != -* ]]
+}
+
+valid_size() {
+  [[ $1 =~ ^[0-9]{1,7}[KMGT]?$ ]]
+}
+
+valid_age() {
+  [[ $1 =~ ^[0-9]{1,7}(s|m|h|d|w)$ ]]
+}
+
+valid_host() {
+  [[ $1 =~ ^[a-zA-Z0-9.-]{1,63}$ ]]
+}
+
+valid_display_name() {
+  [[ $1 =~ ^[[:print:]]{1,64}$ ]]
+}
+
+valid_vfs_mode() {
+  case $1 in
+    off|minimal|writes|full) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ensure_dirs() {
   mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$(dirname "$UNIT_FILE")" "$(dirname "$BOOKMARKS")"
+  local d
+  for d in "$CONFIG_DIR" "$CACHE_DIR" "$(dirname "$UNIT_FILE")" "$(dirname "$BOOKMARKS")"; do
+    safe_dir "$d" || fail "refusing to use unsafe directory: $d"
+  done
 }
 
 save_config() {
   ensure_dirs
-  cat >"$CONFIG_FILE" <<EOF
+  local tmp
+  tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX") || fail "cannot create temp config"
+  cat >"$tmp" <<EOF
 remote=$remote
 bind=$bind
 dav_host=$dav_host
@@ -71,6 +182,8 @@ cache_max_age=$cache_max_age
 display_name=$display_name
 vfs_cache_mode=$vfs_cache_mode
 EOF
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; fail "cannot replace config"; }
 }
 
 write_default_config() {
@@ -96,36 +209,72 @@ load_config() {
   cache_max_age=$DEFAULT_CACHE_MAX_AGE
   display_name=$DEFAULT_DISPLAY_NAME
   vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
-  local key value
-  while IFS='=' read -r key value; do
-    [[ -z ${key:-} || $key == \#* ]] && continue
-    case $key in
-      remote) remote=$value ;;
-      bind) bind=$value ;;
-      addr)
-        # Migrate v0.1 bind-only configs.
-        bind=$value
-        dav_host=$DEFAULT_DAV_HOST
-        ;;
-      dav_host) dav_host=$value ;;
-      cache_max_size) cache_max_size=$value ;;
-      cache_max_age) cache_max_age=$value ;;
-      display_name) display_name=$value ;;
-      vfs_cache_mode) vfs_cache_mode=$value ;;
-    esac
-  done <"$CONFIG_FILE"
-  [[ $remote == *: ]] || remote="${remote}:"
+  local key value cfg_size remote_name
+  cfg_size=$(stat -c '%s' "$CONFIG_FILE" 2>/dev/null || echo 65537)
+  if [[ 10#$cfg_size -le 65536 ]]; then
+    while IFS='=' read -r key value; do
+      [[ -z ${key:-} || $key == \#* ]] && continue
+      case $key in
+        remote) remote=$value ;;
+        bind) bind=$value ;;
+        addr)
+          # Migrate v0.1 bind-only configs.
+          bind=$value
+          dav_host=$DEFAULT_DAV_HOST
+          ;;
+        dav_host) dav_host=$value ;;
+        cache_max_size) cache_max_size=$value ;;
+        cache_max_age) cache_max_age=$value ;;
+        display_name) display_name=$value ;;
+        vfs_cache_mode) vfs_cache_mode=$value ;;
+      esac
+    done <"$CONFIG_FILE"
+  else
+    echo "$APP: config is oversized, using defaults" >&2
+  fi
+  # Strict schemas: anything invalid falls back to the documented default.
+  remote_name=${remote%:}
+  if ! valid_remote_name "$remote_name"; then
+    echo "$APP: invalid remote '$remote' in config, using default" >&2
+    remote_name=${DEFAULT_REMOTE%:}
+  fi
+  remote="${remote_name}:"
+  if ! valid_bind "$bind"; then
+    echo "$APP: invalid bind '$bind' in config, using default" >&2
+    bind=$DEFAULT_BIND
+  fi
+  if ! valid_size "$cache_max_size"; then
+    echo "$APP: invalid cache_max_size '$cache_max_size' in config, using default" >&2
+    cache_max_size=$DEFAULT_CACHE_MAX_SIZE
+  fi
+  if ! valid_age "$cache_max_age"; then
+    echo "$APP: invalid cache_max_age '$cache_max_age' in config, using default" >&2
+    cache_max_age=$DEFAULT_CACHE_MAX_AGE
+  fi
+  if ! valid_host "$dav_host"; then
+    echo "$APP: invalid dav_host '$dav_host' in config, using default" >&2
+    dav_host=$DEFAULT_DAV_HOST
+  fi
+  if ! valid_display_name "$display_name"; then
+    echo "$APP: invalid display_name in config, using default" >&2
+    display_name=$DEFAULT_DISPLAY_NAME
+  fi
+  if ! valid_vfs_mode "$vfs_cache_mode"; then
+    echo "$APP: invalid vfs_cache_mode '$vfs_cache_mode' in config, using default" >&2
+    vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
+  fi
   port=${bind##*:}
   dav_uri="dav://${dav_host}:${port}/"
   old_uri="dav://127.0.0.1:${port}/"
 }
 
 find_rclone() {
-  if [[ -x $HOME/.local/bin/rclone ]]; then
-    echo "$HOME/.local/bin/rclone"
+  local candidate
+  for candidate in /usr/local/bin/rclone /usr/bin/rclone; do
+    safe_exec "$candidate" || continue
+    echo "$candidate"
     return
-  fi
-  command -v rclone 2>/dev/null || true
+  done
 }
 
 remote_configured() {
@@ -138,12 +287,17 @@ remote_configured() {
 # Does not print secrets.
 session_present() {
   local name=${remote%:}
+  [[ -f $RCLONE_CONF ]] || return 1
   python3 - "$RCLONE_CONF" "$name" <<'PY'
 import configparser, sys
 path, section = sys.argv[1], sys.argv[2]
 c = configparser.ConfigParser()
 try:
-    c.read(path)
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        blob = fh.read(1048577)
+    if len(blob) > 1048576:
+        sys.exit(1)
+    c.read_string(blob)
 except Exception:
     sys.exit(1)
 if not c.has_section(section):
@@ -156,7 +310,9 @@ PY
 
 write_unit() {
   load_config
-  cat >"$UNIT_FILE" <<EOF
+  local tmp
+  tmp=$(mktemp "$(dirname "$UNIT_FILE")/.fast-fruit-drive.XXXXXX") || fail "cannot create temp unit"
+  cat >"$tmp" <<EOF
 [Unit]
 Description=Fast Fruit Drive — rclone iCloud WebDAV for Nautilus
 After=network-online.target
@@ -170,7 +326,9 @@ Type=simple
 ExecStart=$HERE/$APP serve
 Restart=on-failure
 RestartSec=5s
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+Environment=PATH=/usr/local/bin:/usr/bin
+NoNewPrivileges=yes
+UMask=0077
 LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
@@ -179,24 +337,38 @@ SyslogIdentifier=$APP
 [Install]
 WantedBy=default.target
 EOF
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$UNIT_FILE" || { rm -f "$tmp"; fail "cannot replace unit"; }
   systemctl --user daemon-reload
   systemctl --user enable "$UNIT" >/dev/null
 }
 
+# Atomic bookmark rewrite: validated directory, same-filesystem temp
+# file, rename into place. $1 = line to append, or empty to only filter.
+rewrite_bookmarks() {
+  local append="${1:-}" dir tmp line
+  dir=$(dirname "$BOOKMARKS")
+  mkdir -p "$dir"
+  safe_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
+  touch "$BOOKMARKS"
+  safe_file "$BOOKMARKS" || fail "refusing to touch unsafe bookmarks file: $BOOKMARKS"
+  tmp=$(mktemp "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp bookmarks file"
+  {
+    while IFS= read -r line || [[ -n $line ]]; do
+      if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
+        continue
+      fi
+      printf '%s\n' "$line"
+    done <"$BOOKMARKS"
+    [[ -z $append ]] || printf '%s\n' "$append"
+  } >"$tmp" || { rm -f "$tmp"; fail "cannot rewrite bookmarks"; }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$BOOKMARKS" || { rm -f "$tmp"; fail "cannot replace bookmarks"; }
+}
+
 ensure_bookmark() {
   load_config
-  local tmp line
-  mkdir -p "$(dirname "$BOOKMARKS")"
-  touch "$BOOKMARKS"
-  tmp=$(mktemp)
-  while IFS= read -r line || [[ -n $line ]]; do
-    if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
-      continue
-    fi
-    printf '%s\n' "$line"
-  done <"$BOOKMARKS" >"$tmp"
-  printf '%s %s\n' "$dav_uri" "$display_name" >>"$tmp"
-  mv "$tmp" "$BOOKMARKS"
+  rewrite_bookmarks "$dav_uri $display_name"
 }
 
 service_running() {
@@ -235,14 +407,19 @@ cache_bytes() {
 }
 
 install_nautilus_extension() {
-  local src dest dir
+  local src dest dir tmp
   src="$PLUGIN_DIR/nautilus/fast_fruit_drive_nautilus.py"
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
   dest="$dir/fast_fruit_drive_nautilus.py"
   [[ -f $src ]] || return 0
   mkdir -p "$dir"
+  safe_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
+  [[ ! -L $dest ]] || fail "refusing to replace symlink: $dest"
   if [[ ! -f $dest ]] || ! cmp -s "$src" "$dest"; then
-    cp -f "$src" "$dest"
+    tmp=$(mktemp "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp extension file"
+    cp "$src" "$tmp" || { rm -f "$tmp"; fail "cannot copy Nautilus extension"; }
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; fail "cannot replace Nautilus extension"; }
   fi
 }
 
@@ -257,7 +434,7 @@ require_packages() {
   fi
   {
     echo "$APP: required packages missing. Run: omarchy pkg add gvfs-dnssd rclone"
-    [[ $need_rclone == true ]] && echo "  - rclone — serves iCloud over WebDAV (or a binary from rclone.org)"
+    [[ $need_rclone == true ]] && echo "  - rclone — serves iCloud over WebDAV"
     [[ $need_gvfs == true ]] && echo "  - gvfs-dnssd — the Nautilus WebDAV backend"
     echo "Then toggle Fast Fruit Drive on again."
   } >&2
@@ -280,6 +457,7 @@ cmd_serve() {
   [[ -n $rclone_bin ]] || fail "rclone not found"
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured"
   mkdir -p "$CACHE_DIR"
+  safe_dir "$CACHE_DIR" || fail "refusing to use unsafe cache directory: $CACHE_DIR"
   local args=(
     serve webdav "$remote"
     --addr "$bind"
@@ -350,7 +528,7 @@ cmd_open() {
   # Direct spawn: the helper inherits the full session environment, and
   # uwsm-app serializes launches through a FIFO daemon whose cold start
   # (early login, hung daemon) can block for seconds before the window appears.
-  nautilus "$dav_uri" >/dev/null 2>&1 &
+  setsid nautilus "$dav_uri" >/dev/null 2>&1 &
 }
 
 cmd_login() {
@@ -397,23 +575,54 @@ cmd_login_tui() {
 cmd_configure() {
   load_config
   local restart=false
-  local key value changed=false
+  local key value rname changed=false
   for pair in "$@"; do
     key=${pair%%=*}
     value=${pair#*=}
     case $key in
-      cache_max_size) [[ $value == "$cache_max_size" ]] || changed=true; cache_max_size=$value ;;
-      cache_max_age) [[ $value == "$cache_max_age" ]] || changed=true; cache_max_age=$value ;;
-      cache_max_age_hours)
-        value="${value}h"
+      cache_max_size)
+        valid_size "$value" || fail "invalid cache_max_size: $value"
+        [[ $value == "$cache_max_size" ]] || changed=true
+        cache_max_size=$value
+        ;;
+      cache_max_age)
+        valid_age "$value" || fail "invalid cache_max_age: $value"
         [[ $value == "$cache_max_age" ]] || changed=true
         cache_max_age=$value
         ;;
-      remote) [[ $value == "$remote" ]] || changed=true; remote=$value ;;
-      bind) [[ $value == "$bind" ]] || changed=true; bind=$value ;;
-      dav_host) [[ $value == "$dav_host" ]] || changed=true; dav_host=$value ;;
-      display_name) [[ $value == "$display_name" ]] || changed=true; display_name=$value ;;
-      vfs_cache_mode) [[ $value == "$vfs_cache_mode" ]] || changed=true; vfs_cache_mode=$value ;;
+      cache_max_age_hours)
+        value="${value}h"
+        valid_age "$value" || fail "invalid cache_max_age_hours: $value"
+        [[ $value == "$cache_max_age" ]] || changed=true
+        cache_max_age=$value
+        ;;
+      remote)
+        rname=${value%:}
+        valid_remote_name "$rname" || fail "invalid remote name: $value"
+        value="${rname}:"
+        [[ $value == "$remote" ]] || changed=true
+        remote=$value
+        ;;
+      bind)
+        valid_bind "$value" || fail "invalid bind (loopback host only): $value"
+        [[ $value == "$bind" ]] || changed=true
+        bind=$value
+        ;;
+      dav_host)
+        valid_host "$value" || fail "invalid dav_host: $value"
+        [[ $value == "$dav_host" ]] || changed=true
+        dav_host=$value
+        ;;
+      display_name)
+        valid_display_name "$value" || fail "invalid display_name: $value"
+        [[ $value == "$display_name" ]] || changed=true
+        display_name=$value
+        ;;
+      vfs_cache_mode)
+        valid_vfs_mode "$value" || fail "invalid vfs_cache_mode: $value"
+        [[ $value == "$vfs_cache_mode" ]] || changed=true
+        vfs_cache_mode=$value
+        ;;
       restart) restart=$(bool "$value") ;;
       *) fail "unknown configure key: $key" ;;
     esac
@@ -437,8 +646,9 @@ cmd_clear_cache() {
   if [[ $was_running == true ]]; then
     systemctl --user stop "$UNIT" || fail "could not stop $UNIT"
   fi
-  rm -rf "$CACHE_DIR"
+  safe_rm_rf "$CACHE_DIR" || fail "refusing to clear unsafe cache path: $CACHE_DIR"
   mkdir -p "$CACHE_DIR"
+  safe_dir "$CACHE_DIR" || fail "refusing to use unsafe cache path: $CACHE_DIR"
   if [[ $was_running == true ]]; then
     systemctl --user start "$UNIT" || fail "could not start $UNIT"
     wait_for_server || fail "WebDAV did not come back — see: journalctl --user -u $UNIT"
@@ -447,7 +657,7 @@ cmd_clear_cache() {
 }
 
 remove_bookmark() {
-  local tmp line port
+  local port
   [[ -f $BOOKMARKS ]] || return 0
   if [[ -f $CONFIG_FILE ]]; then
     load_config
@@ -456,14 +666,7 @@ remove_bookmark() {
     dav_uri="dav://${DEFAULT_DAV_HOST}:${port}/"
     old_uri="dav://127.0.0.1:${port}/"
   fi
-  tmp=$(mktemp)
-  while IFS= read -r line || [[ -n $line ]]; do
-    if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
-      continue
-    fi
-    printf '%s\n' "$line"
-  done <"$BOOKMARKS" >"$tmp"
-  mv "$tmp" "$BOOKMARKS"
+  rewrite_bookmarks ""
 }
 
 remove_nautilus_extension() {
@@ -481,7 +684,8 @@ cmd_uninstall() {
   systemctl --user daemon-reload >/dev/null 2>&1 || true
   remove_bookmark
   remove_nautilus_extension
-  rm -rf "$CONFIG_DIR" "$CACHE_DIR"
+  safe_rm_rf "$CONFIG_DIR" || echo "$APP: refusing to delete unsafe path: $CONFIG_DIR" >&2
+  safe_rm_rf "$CACHE_DIR" || echo "$APP: refusing to delete unsafe path: $CACHE_DIR" >&2
   echo "$APP: removed unit, bookmark, emblems, $CONFIG_DIR, and $CACHE_DIR"
   echo "$APP: left ~/.config/rclone/rclone.conf untouched (Apple session is rclone's)"
 }
