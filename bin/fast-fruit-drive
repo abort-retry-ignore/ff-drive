@@ -665,15 +665,19 @@ cmd_toggle() {
 
 cmd_open() {
   load_config
+  # Same path as Super-Shift-F: `omarchy launch nautilus` →
+  # `setsid uwsm-app -- nautilus --new-window`. Do not pass the DAV URI —
+  # the first gvfs connect after login is slow, and the sidebar bookmark
+  # is enough to get to iCloud Drive.
+  if [[ -n $BIN_OMARCHY ]]; then
+    "$BIN_OMARCHY" launch nautilus >/dev/null 2>&1 &
+  else
+    [[ -n $BIN_SETSID && -n $BIN_NAUTILUS ]] || fail "nautilus not found"
+    "$BIN_SETSID" "$BIN_NAUTILUS" --new-window >/dev/null 2>&1 &
+  fi
   service_running || cmd_start
   mount_dav
   ensure_bookmark
-  [[ -n $BIN_SETSID && -n $BIN_NAUTILUS ]] || fail "nautilus not found"
-  # Direct spawn: the helper inherits the full session environment, and
-  # uwsm-app serializes launches through a FIFO daemon whose cold start
-  # (early login, hung daemon) can block for seconds before the window appears.
-  # setsid so a watchdog SIGTERM of this helper cannot touch the window.
-  "$BIN_SETSID" "$BIN_NAUTILUS" "$dav_uri" >/dev/null 2>&1 &
 }
 
 cmd_login() {
