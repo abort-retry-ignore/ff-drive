@@ -4,6 +4,9 @@ Fast Fruit Drive — Nautilus emblems for iCloud WebDAV cache/upload state.
 Uses InfoProvider.update_file_info_full so Dirty files stay IN_PROGRESS and
 the emblem is refreshed when upload finishes (no Ctrl+R).
 
+Monitors on the VFS cache directories invalidate displayed rows when rclone
+hydrates or evicts a file, so cloud-only → cached transitions update live.
+
 Dirty (uploading):     emblem-synchronizing
 Cached and uploaded:   emblem-default
 Cloud-only:            emblem-documents
@@ -20,7 +23,7 @@ from gi import require_version
 
 require_version("Nautilus", "4.1")
 
-from gi.repository import GLib, GObject, Nautilus  # noqa: E402
+from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
 
 CONFIG = os.path.expanduser("~/.config/fast-fruit-drive/config")
 DEFAULT_CACHE = os.path.expanduser("~/.cache/fast-fruit-drive")
@@ -37,6 +40,15 @@ _cfg = None
 _cfg_at = 0.0
 _watched_dirty: set[str] = set()
 _dirty_dirs: set[str] = set()
+
+# Live emblem refresh: rows we have displayed, keyed by their path relative to
+# the remote root, and one cache-directory monitor per displayed folder. When
+# rclone hydrates or evicts a file, the monitor invalidates that row's
+# extension info and Nautilus re-asks for the emblem — no manual reload.
+_rows: dict[str, object] = {}
+_row_monitors: dict[str, object] = {}
+_ROWS_CAP = 4096
+_MONITORS_CAP = 128
 
 
 def _load_config() -> dict:
@@ -157,6 +169,79 @@ def _apply_emblem(file_info, status: str) -> None:
         file_info.add_emblem(emblem)
 
 
+def _remember_row(rel: str, file_info) -> None:
+    if len(_rows) >= _ROWS_CAP:
+        _rows.clear()
+    _rows[rel] = file_info
+
+
+def _ensure_monitor(cfg: dict, dir_rel: str) -> None:
+    if dir_rel in _row_monitors:
+        return
+    if len(_row_monitors) >= _MONITORS_CAP:
+        for monitor in _row_monitors.values():
+            monitor.cancel()
+        _row_monitors.clear()
+    cache_dir = os.path.join(cfg["vfs_root"], dir_rel) if dir_rel else cfg["vfs_root"]
+    if not os.path.isdir(cache_dir):
+        return
+    try:
+        monitor = Gio.File.new_for_path(cache_dir).monitor_directory(Gio.FileMonitorFlags.NONE)
+    except Exception:
+        return
+    if monitor is None:
+        return
+    monitor.connect("changed", _on_cache_changed, dir_rel)
+    _row_monitors[dir_rel] = monitor
+
+
+def _invalidate_row(rel: str) -> None:
+    file_info = _rows.get(rel)
+    if file_info is None:
+        return
+    try:
+        if file_info.is_gone():
+            _rows.pop(rel, None)
+            return
+        file_info.invalidate_extension_info()
+    except Exception:
+        _rows.pop(rel, None)
+
+
+def _on_cache_changed(monitor, gfile, other_file, event_type, dir_rel) -> None:
+    if event_type not in (
+        Gio.FileMonitorEvent.CREATED,
+        Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+        Gio.FileMonitorEvent.ATTRIBUTE_CHANGED,
+        Gio.FileMonitorEvent.DELETED,
+        Gio.FileMonitorEvent.MOVED,
+    ):
+        return
+    name = gfile.get_basename() if gfile is not None else None
+    if name:
+        child_rel = f"{dir_rel}/{name}" if dir_rel else name
+        _invalidate_row(child_rel)
+        # A directory appearing in the cache means its contents just started
+        # hydrating: attach its monitor now so the files inside it are seen.
+        if event_type == Gio.FileMonitorEvent.CREATED:
+            _ensure_monitor(_load_config(), child_rel)
+    if event_type == Gio.FileMonitorEvent.MOVED and other_file is not None:
+        other = other_file.get_basename()
+        if other:
+            _invalidate_row(f"{dir_rel}/{other}" if dir_rel else other)
+    if monitor.is_cancelled():
+        _row_monitors.pop(dir_rel, None)
+
+
+def _register_row(cfg: dict, rel: str, file_info) -> None:
+    """Track a displayed row and watch the cache dir of the folder listing it."""
+    _remember_row(rel, file_info)
+    if file_info.is_directory():
+        _ensure_monitor(cfg, rel)
+    parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    _ensure_monitor(cfg, parent)
+
+
 class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
     def __init__(self):
         super().__init__()
@@ -167,6 +252,7 @@ class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         rel = _rel_from_uri(uri)
         if rel is None:
             return
+        _register_row(_load_config(), rel, file_info)
         _apply_emblem(file_info, _status(rel, file_info.is_directory()))
 
     def update_file_info_full(self, provider, handle, closure, file_info):
@@ -174,6 +260,7 @@ class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         rel = _rel_from_uri(uri)
         if rel is None:
             return Nautilus.OperationResult.COMPLETE
+        _register_row(_load_config(), rel, file_info)
         st = _status(rel, file_info.is_directory())
         _apply_emblem(file_info, st)
         if st != "dirty" or file_info.is_directory():

@@ -70,7 +70,8 @@ Nautilus emblems (same idea as StratoSync):
 - checkmark — in the local cache and uploaded
 - document — listed from iCloud, not hydrated locally
 
-Refresh the folder (Ctrl+R) if an emblem looks stale.
+Emblems refresh themselves as files hydrate, upload, or get evicted —
+Ctrl+R still works if anything ever looks stale.
 
 ## Configure
 
