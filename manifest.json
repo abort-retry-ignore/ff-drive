@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.abort-retry-ignore.ff-drive",
   "name": "Fast Fruit Drive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Igor Divjak",
   "license": "MIT",
   "description": "On-demand iCloud Drive in Nautilus via rclone WebDAV. Browse fast, cache only what you open.",

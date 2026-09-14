@@ -30,12 +30,11 @@ omarchy plugin remove io.github.abort-retry-ignore.ff-drive
 ## Requirements
 
 - [Omarchy](https://omarchy.org/) with third-party shell plugins
-- [`rclone`](https://rclone.org/downloads/) on `PATH` (or `~/.local/bin/rclone`)
-- `gvfs-dnssd` (Nautilus WebDAV backend) — see [Install](#install)
-- `nautilus-python` (emblems; optional): `omarchy pkg add nautilus-python`
+- `rclone` and `gvfs-dnssd` — installed by the command in [Install](#install)
+- `nautilus-python` for emblems — included with a standard Omarchy install
 
-Install rclone from your package manager or [rclone.org/downloads](https://rclone.org/downloads/).
-This plugin never downloads or executes remote installers.
+Both packages come from the official repositories. This plugin never
+downloads or executes remote installers.
 
 ## Sign-in and token expiry
 
@@ -113,9 +112,14 @@ Starting the drive (explicit toggle or `start`) writes only:
 
 - No rclone purge/delete flags
 - Cache eviction is local only
-- Binds to `127.0.0.1` / `::1` only
+- Binds to `127.0.0.1` / `::1` only (enforced by validation)
 - No sudo or pkexec
 - Does not overwrite `rclone.conf`
+- rclone is resolved only from root-owned standard locations; the service
+  PATH contains no user-writable directories
+- Config, unit, and bookmark writes are atomic and replace only validated,
+  symlink-free paths; cache deletion refuses symlinked paths
+- Widget output is size-capped and every helper call runs under a deadline
 
 ## Development
 
