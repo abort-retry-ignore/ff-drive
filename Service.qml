@@ -50,22 +50,42 @@ Item {
   readonly property int outputCap: 65536
 
   function collectStatusOut(line) {
-    if (_statusOutput.length > outputCap) { _statusOverflow = true; return }
+    if (_statusOverflow) return
+    if (_statusOutput.length + line.length + 1 > outputCap) {
+      _statusOverflow = true
+      statusProcess.running = false
+      return
+    }
     _statusOutput += line + "\n"
   }
 
   function collectStatusErr(line) {
-    if (_statusError.length > outputCap) { _statusOverflow = true; return }
+    if (_statusOverflow) return
+    if (_statusError.length + line.length + 1 > outputCap) {
+      _statusOverflow = true
+      statusProcess.running = false
+      return
+    }
     _statusError += line + "\n"
   }
 
   function collectControlOut(line) {
-    if (_controlOutput.length > outputCap) { _controlOverflow = true; return }
+    if (_controlOverflow) return
+    if (_controlOutput.length + line.length + 1 > outputCap) {
+      _controlOverflow = true
+      controlProcess.running = false
+      return
+    }
     _controlOutput += line + "\n"
   }
 
   function collectControlErr(line) {
-    if (_controlError.length > outputCap) { _controlOverflow = true; return }
+    if (_controlOverflow) return
+    if (_controlError.length + line.length + 1 > outputCap) {
+      _controlOverflow = true
+      controlProcess.running = false
+      return
+    }
     _controlError += line + "\n"
   }
 

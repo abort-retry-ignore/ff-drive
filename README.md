@@ -115,11 +115,13 @@ Starting the drive (explicit toggle or `start`) writes only:
 - Binds to `127.0.0.1` / `::1` only (enforced by validation)
 - No sudo or pkexec
 - Does not overwrite `rclone.conf`
-- rclone is resolved only from root-owned standard locations; the service
-  PATH contains no user-writable directories
-- Config, unit, and bookmark writes are atomic and replace only validated,
+- rclone, python3, systemctl, gio, curl, nautilus, jq and coreutils are
+  resolved as verified absolute executables; the service PATH is `/usr/bin`
+- Directories are created component-wise with no-follow ancestor checks;
+  config, unit, and bookmark writes are atomic and replace only validated,
   symlink-free paths; cache deletion refuses symlinked paths
-- Widget output is size-capped and every helper call runs under a deadline
+- Widget output is size-capped and kills the helper on overflow; every
+  helper call runs under a deadline that SIGTERMs the process group
 
 ## Development
 

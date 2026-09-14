@@ -2,16 +2,40 @@
 # Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
 set -euo pipefail
 
-# Closed environment: every tool resolves from root-owned standard
-# directories; user-writable PATH entries are never consulted.
-PATH=/usr/local/bin:/usr/bin
+# Closed environment: user-writable PATH entries are never consulted.
+# Named tools are still resolved as verified absolute executables below.
+PATH=/usr/bin
 export PATH
 
+# If the widget watchdog SIGTERMs us, take the whole process group
+# (curl/gio children). Nautilus is spawned with setsid so it survives.
+trap 'trap - TERM INT; kill -- -$$ 2>/dev/null || true' TERM INT
+
 readonly USER_UID=$EUID
+readonly STAT=/usr/bin/stat
+readonly MKDIR=/usr/bin/mkdir
+readonly RM=/usr/bin/rm
+readonly MV=/usr/bin/mv
+readonly CP=/usr/bin/cp
+readonly REALPATH=/usr/bin/realpath
+readonly MKTEMP=/usr/bin/mktemp
+readonly CHMOD=/usr/bin/chmod
+readonly TOUCH=/usr/bin/touch
+readonly CAT=/usr/bin/cat
+readonly SLEEP=/usr/bin/sleep
+readonly READLINK=/usr/bin/readlink
+readonly GREP=/usr/bin/grep
+readonly AWK=/usr/bin/awk
+readonly DU=/usr/bin/du
+readonly CMP=/usr/bin/cmp
+readonly NUMFMT=/usr/bin/numfmt
 
 APP=fast-fruit-drive
 UNIT=fast-fruit-drive.service
-HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+_src=${BASH_SOURCE[0]}
+_dir=${_src%/*}
+[[ $_dir == "$_src" ]] && _dir=.
+HERE=$(cd "$_dir" && pwd)
 PLUGIN_DIR=$(cd "$HERE/.." && pwd)
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
@@ -28,8 +52,18 @@ DEFAULT_CACHE_MAX_AGE="24h"
 DEFAULT_DISPLAY_NAME="iCloud Drive"
 DEFAULT_VFS_CACHE_MODE="full"
 
+BIN_PYTHON3=
+BIN_SYSTEMCTL=
+BIN_GIO=
+BIN_CURL=
+BIN_JQ=
+BIN_NAUTILUS=
+BIN_SETSID=
+BIN_OMARCHY=
+BIN_XDG_TERMINAL=
+
 usage() {
-  cat <<EOF
+  $CAT <<EOF
 Usage: $APP <command> [args]
 
 Commands:
@@ -76,9 +110,27 @@ safe_dir() {
     [[ -n $part ]] || continue
     cur="$cur/$part"
     [[ ! -L $cur && -d $cur ]] || return 1
-    owner=$(stat -c '%u' "$cur")
-    mode=$(stat -c '%a' "$cur")
+    owner=$($STAT -c '%u' "$cur")
+    mode=$($STAT -c '%a' "$cur")
     [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
+    [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
+  done
+  return 0
+}
+
+# Same walk, but every ancestor must be root-owned (executable identity).
+safe_dir_root() {
+  local path="$1" cur="" part owner mode
+  [[ $path == /* ]] || return 1
+  [[ $path == "/" ]] && return 0
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for part in "${parts[@]}"; do
+    [[ -n $part ]] || continue
+    cur="$cur/$part"
+    [[ ! -L $cur && -d $cur ]] || return 1
+    owner=$($STAT -c '%u' "$cur")
+    mode=$($STAT -c '%a' "$cur")
+    [[ $owner == 0 ]] || return 1
     [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
   done
   return 0
@@ -88,7 +140,7 @@ safe_dir() {
 safe_file() {
   local path="$1" owner
   [[ -f $path && ! -L $path ]] || return 1
-  owner=$(stat -c '%u' "$path")
+  owner=$($STAT -c '%u' "$path")
   [[ $owner == "$USER_UID" || $owner == 0 ]]
 }
 
@@ -99,12 +151,69 @@ safe_exec() {
   local path="$1" dir owner mode
   [[ $path == /* ]] || return 1
   [[ -f $path && ! -L $path && -x $path ]] || return 1
-  owner=$(stat -c '%u' "$path")
-  mode=$(stat -c '%a' "$path")
+  owner=$($STAT -c '%u' "$path")
+  mode=$($STAT -c '%a' "$path")
   [[ $owner == 0 ]] || return 1
   [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
   dir=${path%/*}
-  safe_dir "$dir" || return 1
+  safe_dir_root "$dir" || return 1
+  return 0
+}
+
+# Resolve a /usr/bin or /usr/local/bin path to a verified regular executable.
+# Root-owned symlinks are followed at most three hops, never through `..`,
+# and only into /usr/{bin,local/bin,lib,share}.
+verified_exec() {
+  local path="$1" target owner hops=0
+  [[ $path == /usr/bin/* || $path == /usr/local/bin/* ]] || return 1
+  while [[ -L $path ]]; do
+    hops=$((hops + 1))
+    [[ $hops -le 3 ]] || return 1
+    owner=$($STAT -c '%u' "$path")
+    [[ $owner == 0 ]] || return 1
+    safe_dir_root "${path%/*}" || return 1
+    target=$($READLINK -n "$path") || return 1
+    [[ -n $target && $target != *..* ]] || return 1
+    [[ $target == /* ]] || target="${path%/*}/$target"
+    [[ $target == /usr/bin/* || $target == /usr/local/bin/* || $target == /usr/lib/* || $target == /usr/share/* ]] || return 1
+    path=$target
+  done
+  safe_exec "$path" || return 1
+  printf '%s\n' "$path"
+}
+
+find_verified() {
+  local name="$1" candidate resolved
+  for candidate in "/usr/bin/$name" "/usr/local/bin/$name"; do
+    resolved=$(verified_exec "$candidate") || continue
+    printf '%s\n' "$resolved"
+    return 0
+  done
+  return 1
+}
+
+# Create $1 component-wise. Never follows a symlink; existing components
+# must pass safe_dir; missing components are mkdir'd and re-checked.
+ensure_dir() {
+  local path="$1" cur="" part owner mode
+  [[ $path == /* ]] || return 1
+  IFS='/' read -r -a parts <<< "${path#/}"
+  for part in "${parts[@]}"; do
+    [[ -n $part ]] || continue
+    cur="$cur/$part"
+    if [[ -L $cur || -e $cur ]]; then
+      [[ ! -L $cur && -d $cur ]] || return 1
+      owner=$($STAT -c '%u' "$cur")
+      mode=$($STAT -c '%a' "$cur")
+      [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
+      [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
+    else
+      $MKDIR -m 700 "$cur" || return 1
+      [[ ! -L $cur && -d $cur ]] || return 1
+      owner=$($STAT -c '%u' "$cur")
+      [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
+    fi
+  done
   return 0
 }
 
@@ -113,13 +222,38 @@ safe_exec() {
 # resolved home directory — a planted symlink is refused, not followed.
 safe_rm_rf() {
   local path="$1" real_home real_path
+  [[ -L $path ]] && return 1
   [[ -e $path ]] || return 0
-  real_home=$(realpath "$HOME")
-  real_path=$(realpath "$path") || return 1
+  real_home=$($REALPATH "$HOME")
+  real_path=$($REALPATH "$path") || return 1
   [[ $real_path == "$real_home" || $real_path == "$real_home"/* ]] || return 1
   [[ $real_path == "$path" ]] || return 1
   safe_dir "$path" || return 1
-  rm -rf -- "$real_path"
+  $RM -rf -- "$real_path"
+}
+
+assert_coreutils() {
+  local p
+  # stat/readlink are the bootstrap for verified_exec itself.
+  safe_exec "$STAT" || fail "refusing unverified tool: $STAT"
+  safe_exec "$READLINK" || fail "refusing unverified tool: $READLINK"
+  for p in "$MKDIR" "$RM" "$MV" "$CP" "$REALPATH" "$MKTEMP" "$CHMOD" \
+           "$TOUCH" "$CAT" "$SLEEP" "$GREP" "$AWK" "$DU" "$CMP" "$NUMFMT"; do
+    verified_exec "$p" >/dev/null || fail "refusing unverified tool: $p"
+  done
+}
+
+resolve_tools() {
+  assert_coreutils
+  BIN_PYTHON3=$(find_verified python3 || true)
+  BIN_SYSTEMCTL=$(find_verified systemctl || true)
+  BIN_GIO=$(find_verified gio || true)
+  BIN_CURL=$(find_verified curl || true)
+  BIN_JQ=$(find_verified jq || true)
+  BIN_NAUTILUS=$(find_verified nautilus || true)
+  BIN_SETSID=$(find_verified setsid || true)
+  BIN_OMARCHY=$(find_verified omarchy || true)
+  BIN_XDG_TERMINAL=$(find_verified xdg-terminal-exec || true)
 }
 
 # ---- Config value schemas ----------------------------------------------
@@ -162,18 +296,17 @@ valid_vfs_mode() {
 }
 
 ensure_dirs() {
-  mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$(dirname "$UNIT_FILE")" "$(dirname "$BOOKMARKS")"
   local d
-  for d in "$CONFIG_DIR" "$CACHE_DIR" "$(dirname "$UNIT_FILE")" "$(dirname "$BOOKMARKS")"; do
-    safe_dir "$d" || fail "refusing to use unsafe directory: $d"
+  for d in "$CONFIG_DIR" "$CACHE_DIR" "${UNIT_FILE%/*}" "${BOOKMARKS%/*}"; do
+    ensure_dir "$d" || fail "refusing to use unsafe directory: $d"
   done
 }
 
 save_config() {
   ensure_dirs
   local tmp
-  tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX") || fail "cannot create temp config"
-  cat >"$tmp" <<EOF
+  tmp=$($MKTEMP "$CONFIG_DIR/.config.XXXXXX") || fail "cannot create temp config"
+  $CAT >"$tmp" <<EOF
 remote=$remote
 bind=$bind
 dav_host=$dav_host
@@ -182,8 +315,8 @@ cache_max_age=$cache_max_age
 display_name=$display_name
 vfs_cache_mode=$vfs_cache_mode
 EOF
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; fail "cannot replace config"; }
+  $CHMOD 600 "$tmp"
+  $MV -f "$tmp" "$CONFIG_FILE" || { $RM -f "$tmp"; fail "cannot replace config"; }
 }
 
 write_default_config() {
@@ -210,7 +343,7 @@ load_config() {
   display_name=$DEFAULT_DISPLAY_NAME
   vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
   local key value cfg_size remote_name
-  cfg_size=$(stat -c '%s' "$CONFIG_FILE" 2>/dev/null || echo 65537)
+  cfg_size=$($STAT -c '%s' "$CONFIG_FILE" 2>/dev/null || echo 65537)
   if [[ 10#$cfg_size -le 65536 ]]; then
     while IFS='=' read -r key value; do
       [[ -z ${key:-} || $key == \#* ]] && continue
@@ -269,34 +402,31 @@ load_config() {
 }
 
 find_rclone() {
-  local candidate
-  for candidate in /usr/local/bin/rclone /usr/bin/rclone; do
-    safe_exec "$candidate" || continue
-    echo "$candidate"
-    return
-  done
+  find_verified rclone || true
 }
 
 remote_configured() {
   local rclone_bin=$1
   [[ -n $rclone_bin ]] || return 1
-  "$rclone_bin" listremotes 2>/dev/null | grep -Fxq "$remote"
+  "$rclone_bin" listremotes 2>/dev/null | $GREP -Fxq "$remote"
 }
 
 # True when rclone.conf has a session for the remote (trust_token or cookies).
-# Does not print secrets.
+# Does not print secrets. File contents are passed on stdin, never by path.
 session_present() {
-  local name=${remote%:}
-  [[ -f $RCLONE_CONF ]] || return 1
-  python3 - "$RCLONE_CONF" "$name" <<'PY'
+  local name=${remote%:} sz
+  [[ -n $BIN_PYTHON3 ]] || return 1
+  [[ -f $RCLONE_CONF && ! -L $RCLONE_CONF ]] || return 1
+  sz=$($STAT -c '%s' "$RCLONE_CONF" 2>/dev/null || echo 1048577)
+  [[ 10#$sz -le 1048576 ]] || return 1
+  "$BIN_PYTHON3" -c '
 import configparser, sys
-path, section = sys.argv[1], sys.argv[2]
+section = sys.argv[1]
+blob = sys.stdin.read(1048577)
+if len(blob) > 1048576:
+    sys.exit(1)
 c = configparser.ConfigParser()
 try:
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        blob = fh.read(1048577)
-    if len(blob) > 1048576:
-        sys.exit(1)
     c.read_string(blob)
 except Exception:
     sys.exit(1)
@@ -305,14 +435,14 @@ if not c.has_section(section):
 token = c.get(section, "trust_token", fallback="").strip()
 cookies = c.get(section, "cookies", fallback="").strip()
 sys.exit(0 if token or cookies else 1)
-PY
+' "$name" < "$RCLONE_CONF"
 }
 
 write_unit() {
   load_config
   local tmp
-  tmp=$(mktemp "$(dirname "$UNIT_FILE")/.fast-fruit-drive.XXXXXX") || fail "cannot create temp unit"
-  cat >"$tmp" <<EOF
+  tmp=$($MKTEMP "${UNIT_FILE%/*}/.fast-fruit-drive.XXXXXX") || fail "cannot create temp unit"
+  $CAT >"$tmp" <<EOF
 [Unit]
 Description=Fast Fruit Drive — rclone iCloud WebDAV for Nautilus
 After=network-online.target
@@ -326,7 +456,7 @@ Type=simple
 ExecStart=$HERE/$APP serve
 Restart=on-failure
 RestartSec=5s
-Environment=PATH=/usr/local/bin:/usr/bin
+Environment=PATH=/usr/bin
 NoNewPrivileges=yes
 UMask=0077
 LimitNOFILE=65536
@@ -337,22 +467,28 @@ SyslogIdentifier=$APP
 [Install]
 WantedBy=default.target
 EOF
-  chmod 644 "$tmp"
-  mv -f "$tmp" "$UNIT_FILE" || { rm -f "$tmp"; fail "cannot replace unit"; }
-  systemctl --user daemon-reload
-  systemctl --user enable "$UNIT" >/dev/null
+  $CHMOD 644 "$tmp"
+  $MV -f "$tmp" "$UNIT_FILE" || { $RM -f "$tmp"; fail "cannot replace unit"; }
+  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
+  "$BIN_SYSTEMCTL" --user daemon-reload
+  "$BIN_SYSTEMCTL" --user enable "$UNIT" >/dev/null
 }
 
 # Atomic bookmark rewrite: validated directory, same-filesystem temp
 # file, rename into place. $1 = line to append, or empty to only filter.
 rewrite_bookmarks() {
   local append="${1:-}" dir tmp line
-  dir=$(dirname "$BOOKMARKS")
-  mkdir -p "$dir"
-  safe_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
-  touch "$BOOKMARKS"
+  dir=${BOOKMARKS%/*}
+  ensure_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
+  if [[ -L $BOOKMARKS ]]; then
+    fail "refusing to touch symlink bookmarks file: $BOOKMARKS"
+  fi
+  if [[ ! -e $BOOKMARKS ]]; then
+    $TOUCH "$BOOKMARKS"
+    $CHMOD 600 "$BOOKMARKS"
+  fi
   safe_file "$BOOKMARKS" || fail "refusing to touch unsafe bookmarks file: $BOOKMARKS"
-  tmp=$(mktemp "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp bookmarks file"
+  tmp=$($MKTEMP "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp bookmarks file"
   {
     while IFS= read -r line || [[ -n $line ]]; do
       if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
@@ -361,9 +497,9 @@ rewrite_bookmarks() {
       printf '%s\n' "$line"
     done <"$BOOKMARKS"
     [[ -z $append ]] || printf '%s\n' "$append"
-  } >"$tmp" || { rm -f "$tmp"; fail "cannot rewrite bookmarks"; }
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$BOOKMARKS" || { rm -f "$tmp"; fail "cannot replace bookmarks"; }
+  } >"$tmp" || { $RM -f "$tmp"; fail "cannot rewrite bookmarks"; }
+  $CHMOD 600 "$tmp"
+  $MV -f "$tmp" "$BOOKMARKS" || { $RM -f "$tmp"; fail "cannot replace bookmarks"; }
 }
 
 ensure_bookmark() {
@@ -372,35 +508,40 @@ ensure_bookmark() {
 }
 
 service_running() {
-  systemctl --user is-active --quiet "$UNIT"
+  [[ -n $BIN_SYSTEMCTL ]] || return 1
+  "$BIN_SYSTEMCTL" --user is-active --quiet "$UNIT"
 }
 
 gio_mounted() {
   load_config
-  gio mount -l 2>/dev/null | grep -Fq "$dav_uri"
+  [[ -n $BIN_GIO ]] || return 1
+  "$BIN_GIO" mount -l 2>/dev/null | $GREP -Fq "$dav_uri"
 }
 
 label_mount() {
   load_config
-  gio set -t string "$dav_uri" metadata::display-name "$display_name" >/dev/null 2>&1 || true
+  [[ -n $BIN_GIO ]] || return 0
+  "$BIN_GIO" set -t string "$dav_uri" metadata::display-name "$display_name" >/dev/null 2>&1 || true
 }
 
 mount_dav() {
   load_config
-  gio mount -u "$old_uri" >/dev/null 2>&1 || true
-  gio mount "$dav_uri" >/dev/null 2>&1 || true
+  [[ -n $BIN_GIO ]] || return 0
+  "$BIN_GIO" mount -u "$old_uri" >/dev/null 2>&1 || true
+  "$BIN_GIO" mount "$dav_uri" >/dev/null 2>&1 || true
   label_mount
 }
 
 unmount_dav() {
   load_config
-  gio mount -u "$dav_uri" >/dev/null 2>&1 || true
-  gio mount -u "$old_uri" >/dev/null 2>&1 || true
+  [[ -n $BIN_GIO ]] || return 0
+  "$BIN_GIO" mount -u "$dav_uri" >/dev/null 2>&1 || true
+  "$BIN_GIO" mount -u "$old_uri" >/dev/null 2>&1 || true
 }
 
 cache_bytes() {
   if [[ -d $CACHE_DIR ]]; then
-    du -sb "$CACHE_DIR" 2>/dev/null | awk '{print $1}'
+    $DU -sb "$CACHE_DIR" 2>/dev/null | $AWK '{print $1}'
   else
     echo 0
   fi
@@ -412,14 +553,13 @@ install_nautilus_extension() {
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
   dest="$dir/fast_fruit_drive_nautilus.py"
   [[ -f $src ]] || return 0
-  mkdir -p "$dir"
-  safe_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
+  ensure_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
   [[ ! -L $dest ]] || fail "refusing to replace symlink: $dest"
-  if [[ ! -f $dest ]] || ! cmp -s "$src" "$dest"; then
-    tmp=$(mktemp "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp extension file"
-    cp "$src" "$tmp" || { rm -f "$tmp"; fail "cannot copy Nautilus extension"; }
-    chmod 644 "$tmp"
-    mv -f "$tmp" "$dest" || { rm -f "$tmp"; fail "cannot replace Nautilus extension"; }
+  if [[ ! -f $dest ]] || ! $CMP -s "$src" "$dest"; then
+    tmp=$($MKTEMP "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp extension file"
+    $CP "$src" "$tmp" || { $RM -f "$tmp"; fail "cannot copy Nautilus extension"; }
+    $CHMOD 644 "$tmp"
+    $MV -f "$tmp" "$dest" || { $RM -f "$tmp"; fail "cannot replace Nautilus extension"; }
   fi
 }
 
@@ -456,8 +596,7 @@ cmd_serve() {
   rclone_bin=$(find_rclone)
   [[ -n $rclone_bin ]] || fail "rclone not found"
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured"
-  mkdir -p "$CACHE_DIR"
-  safe_dir "$CACHE_DIR" || fail "refusing to use unsafe cache directory: $CACHE_DIR"
+  ensure_dir "$CACHE_DIR" || fail "refusing to use unsafe cache directory: $CACHE_DIR"
   local args=(
     serve webdav "$remote"
     --addr "$bind"
@@ -476,11 +615,12 @@ cmd_serve() {
 wait_for_server() {
   load_config
   local i
-  for i in $(seq 1 40); do
-    if curl -sf --max-time 0.4 -o /dev/null -X OPTIONS "http://${bind}/" 2>/dev/null; then
+  [[ -n $BIN_CURL ]] || fail "curl not found"
+  for i in {1..40}; do
+    if "$BIN_CURL" -sf --max-time 0.4 -o /dev/null -X OPTIONS "http://${bind}/" 2>/dev/null; then
       return 0
     fi
-    sleep 0.15
+    $SLEEP 0.15
   done
   return 1
 }
@@ -491,7 +631,8 @@ cmd_start() {
   rclone_bin=$(find_rclone)
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured — use Sign in on the widget"
   session_present || fail "iCloud session missing or expired — use Sign in on the widget"
-  systemctl --user start "$UNIT"
+  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
+  "$BIN_SYSTEMCTL" --user start "$UNIT"
   service_running || fail "service failed to start — see: journalctl --user -u $UNIT"
   wait_for_server || fail "WebDAV did not become ready on http://${bind}/"
   mount_dav
@@ -500,13 +641,15 @@ cmd_start() {
 
 cmd_stop() {
   unmount_dav
-  systemctl --user stop "$UNIT" 2>/dev/null || true
+  [[ -n $BIN_SYSTEMCTL ]] || return 0
+  "$BIN_SYSTEMCTL" --user stop "$UNIT" 2>/dev/null || true
   remove_bookmark
 }
 
 cmd_restart() {
   cmd_ensure
-  systemctl --user restart "$UNIT"
+  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
+  "$BIN_SYSTEMCTL" --user restart "$UNIT"
   wait_for_server || fail "WebDAV did not become ready on http://${bind}/"
   mount_dav
   ensure_bookmark
@@ -525,19 +668,21 @@ cmd_open() {
   service_running || cmd_start
   mount_dav
   ensure_bookmark
+  [[ -n $BIN_SETSID && -n $BIN_NAUTILUS ]] || fail "nautilus not found"
   # Direct spawn: the helper inherits the full session environment, and
   # uwsm-app serializes launches through a FIFO daemon whose cold start
   # (early login, hung daemon) can block for seconds before the window appears.
-  setsid nautilus "$dav_uri" >/dev/null 2>&1 &
+  # setsid so a watchdog SIGTERM of this helper cannot touch the window.
+  "$BIN_SETSID" "$BIN_NAUTILUS" "$dav_uri" >/dev/null 2>&1 &
 }
 
 cmd_login() {
-  if command -v omarchy >/dev/null 2>&1; then
-    omarchy launch tui --app-id=io.github.abort-retry-ignore.ff-drive-login "$HERE/$APP" login-tui
+  if [[ -n $BIN_OMARCHY ]]; then
+    "$BIN_OMARCHY" launch tui --app-id=io.github.abort-retry-ignore.ff-drive-login "$HERE/$APP" login-tui
     return
   fi
-  if command -v xdg-terminal-exec >/dev/null 2>&1; then
-    xdg-terminal-exec -e "$HERE/$APP" login-tui
+  if [[ -n $BIN_XDG_TERMINAL ]]; then
+    "$BIN_XDG_TERMINAL" -e "$HERE/$APP" login-tui
     return
   fi
   fail "open a terminal and run: $HERE/$APP login-tui"
@@ -644,16 +789,26 @@ cmd_clear_cache() {
   freed=$(cache_bytes)
   service_running && was_running=true
   if [[ $was_running == true ]]; then
-    systemctl --user stop "$UNIT" || fail "could not stop $UNIT"
+    [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
+    "$BIN_SYSTEMCTL" --user stop "$UNIT" || fail "could not stop $UNIT"
   fi
-  safe_rm_rf "$CACHE_DIR" || fail "refusing to clear unsafe cache path: $CACHE_DIR"
-  mkdir -p "$CACHE_DIR"
-  safe_dir "$CACHE_DIR" || fail "refusing to use unsafe cache path: $CACHE_DIR"
+  if ! safe_rm_rf "$CACHE_DIR"; then
+    if [[ $was_running == true ]]; then
+      "$BIN_SYSTEMCTL" --user start "$UNIT" || true
+    fi
+    fail "refusing to clear unsafe cache path: $CACHE_DIR"
+  fi
+  if ! ensure_dir "$CACHE_DIR"; then
+    if [[ $was_running == true ]]; then
+      "$BIN_SYSTEMCTL" --user start "$UNIT" || true
+    fi
+    fail "refusing to use unsafe cache path: $CACHE_DIR"
+  fi
   if [[ $was_running == true ]]; then
-    systemctl --user start "$UNIT" || fail "could not start $UNIT"
+    "$BIN_SYSTEMCTL" --user start "$UNIT" || fail "could not start $UNIT"
     wait_for_server || fail "WebDAV did not come back — see: journalctl --user -u $UNIT"
   fi
-  echo "Cache cleared: $(numfmt --to=iec "$freed") freed from $CACHE_DIR"
+  echo "Cache cleared: $($NUMFMT --to=iec "$freed") freed from $CACHE_DIR"
 }
 
 remove_bookmark() {
@@ -670,18 +825,29 @@ remove_bookmark() {
 }
 
 remove_nautilus_extension() {
-  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
-  rm -f "$dir/fast_fruit_drive_nautilus.py"
-  rm -f "$dir/__pycache__/fast_fruit_drive_nautilus"*.pyc
+  local dir dest pyc
+  dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
+  dest="$dir/fast_fruit_drive_nautilus.py"
+  if [[ -e $dest || -L $dest ]]; then
+    $RM -f -- "$dest"
+  fi
+  for pyc in "$dir/__pycache__/fast_fruit_drive_nautilus"*.pyc; do
+    [[ -e $pyc || -L $pyc ]] || continue
+    $RM -f -- "$pyc"
+  done
 }
 
 cmd_uninstall() {
   cmd_stop
-  systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
-  rm -f "$UNIT_FILE"
-  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants/$UNIT"
-  systemctl --user reset-failed "$UNIT" >/dev/null 2>&1 || true
-  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if [[ -n $BIN_SYSTEMCTL ]]; then
+    "$BIN_SYSTEMCTL" --user disable --now "$UNIT" >/dev/null 2>&1 || true
+  fi
+  $RM -f -- "$UNIT_FILE"
+  $RM -f -- "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants/$UNIT"
+  if [[ -n $BIN_SYSTEMCTL ]]; then
+    "$BIN_SYSTEMCTL" --user reset-failed "$UNIT" >/dev/null 2>&1 || true
+    "$BIN_SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
+  fi
   remove_bookmark
   remove_nautilus_extension
   safe_rm_rf "$CONFIG_DIR" || echo "$APP: refusing to delete unsafe path: $CONFIG_DIR" >&2
@@ -692,6 +858,7 @@ cmd_uninstall() {
 
 cmd_status() {
   load_config
+  [[ -n $BIN_JQ ]] || fail "jq not found"
   local rclone_bin running mounted configured gvfs rclone_found cache_used has_session
   rclone_bin=$(find_rclone)
   rclone_found=false
@@ -726,7 +893,7 @@ cmd_status() {
     status_text="Connected"
     [[ $mounted == true ]] || status_text="Serving"
   fi
-  jq -n \
+  $BIN_JQ -n \
     --argjson ok true \
     --argjson ready "$ready" \
     --argjson running "$running" \
@@ -768,6 +935,8 @@ cmd_status() {
       lastError: $lastError
     }'
 }
+
+resolve_tools
 
 cmd=${1:-help}
 shift || true
