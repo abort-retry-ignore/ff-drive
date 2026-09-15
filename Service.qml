@@ -49,6 +49,30 @@ Item {
   // only ever trips when something is very wrong.
   readonly property int outputCap: 65536
 
+  // Each helper call runs in its own session (setsid) with both output
+  // streams hard-cut at the raw-byte level BEFORE any delimiter buffering
+  // (head -c), so an unterminated producer can never accumulate inside the
+  // parser beyond the cap. The wrapper reports its session-leader pid as
+  // an "FFPID:" stderr line so the watchdogs can terminate the entire
+  // private process group explicitly, whatever the shell's own kill does.
+  readonly property string setsidPath: "/usr/bin/setsid"
+  readonly property string bashPath: "/usr/bin/bash"
+  readonly property string headPath: "/usr/bin/head"
+  readonly property string killPath: "/usr/bin/kill"
+  readonly property string capScript: "printf 'FFPID:%s\\n' \"$$\" >&2; trap 'trap - TERM INT; kill -- -$$ 2>/dev/null' TERM INT; set -o pipefail; exec 2> >('" + headPath + "' -c " + outputCap + " >&2); \"$@\" | " + headPath + " -c " + outputCap
+  property int _statusPgid: 0
+  property int _controlPgid: 0
+
+  function wrappedCommand(args) {
+    return [setsidPath, bashPath, "-c", capScript, "ff", helperPath].concat(args)
+  }
+
+  function killGroup(pgid) {
+    if (pgid <= 0) return
+    groupKillProcess.command = [killPath, "-TERM", "--", "-" + String(pgid)]
+    groupKillProcess.running = true
+  }
+
   function collectStatusOut(line) {
     if (_statusOverflow) return
     if (_statusOutput.length + line.length + 1 > outputCap) {
@@ -60,6 +84,11 @@ Item {
   }
 
   function collectStatusErr(line) {
+    if (_statusPgid === 0 && line.indexOf("FFPID:") === 0) {
+      var pid = parseInt(line.substring(6), 10)
+      if (pid > 0) _statusPgid = pid
+      return
+    }
     if (_statusOverflow) return
     if (_statusError.length + line.length + 1 > outputCap) {
       _statusOverflow = true
@@ -80,6 +109,11 @@ Item {
   }
 
   function collectControlErr(line) {
+    if (_controlPgid === 0 && line.indexOf("FFPID:") === 0) {
+      var pid = parseInt(line.substring(6), 10)
+      if (pid > 0) _controlPgid = pid
+      return
+    }
     if (_controlOverflow) return
     if (_controlError.length + line.length + 1 > outputCap) {
       _controlOverflow = true
@@ -117,8 +151,9 @@ Item {
     _statusOutput = ""
     _statusError = ""
     _statusOverflow = false
+    _statusPgid = 0
     refreshing = true
-    statusProcess.command = [helperPath, "status"]
+    statusProcess.command = root.wrappedCommand(["status"])
     statusProcess.running = true
   }
 
@@ -154,7 +189,8 @@ Item {
     _controlOutput = ""
     _controlError = ""
     _controlOverflow = false
-    controlProcess.command = [helperPath].concat(args)
+    _controlPgid = 0
+    controlProcess.command = root.wrappedCommand(args)
     controlProcess.running = true
   }
 
@@ -209,6 +245,8 @@ Item {
     repeat: false
     running: statusProcess.running
     onTriggered: {
+      root.killGroup(root._statusPgid)
+      root._statusPgid = 0
       statusProcess.running = false
       root.refreshing = false
       root.lastError = "Fast Fruit Drive status timed out"
@@ -221,6 +259,8 @@ Item {
     repeat: false
     running: controlProcess.running
     onTriggered: {
+      root.killGroup(root._controlPgid)
+      root._controlPgid = 0
       controlProcess.running = false
       root._desired = -1
       root.lastError = "Fast Fruit Drive command timed out"
@@ -248,6 +288,12 @@ Item {
   }
 
   Process {
+    id: groupKillProcess
+    running: false
+    command: []
+  }
+
+  Process {
     id: statusProcess
     running: false
     command: []
@@ -255,6 +301,7 @@ Item {
     stderr: SplitParser { onRead: function(line) { root.collectStatusErr(line) } }
     onExited: function(exitCode) {
       root.refreshing = false
+      root._statusPgid = 0
       if (root._statusOverflow) {
         root._statusOverflow = false
         root.lastError = "Fast Fruit Drive status output exceeded safety limit"
@@ -272,6 +319,7 @@ Item {
     stdout: SplitParser { onRead: function(line) { root.collectControlOut(line) } }
     stderr: SplitParser { onRead: function(line) { root.collectControlErr(line) } }
     onExited: function(exitCode) {
+      root._controlPgid = 0
       if (root._controlOverflow) {
         root._controlOverflow = false
         root._desired = -1
