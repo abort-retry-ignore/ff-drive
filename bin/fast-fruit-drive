@@ -14,20 +14,13 @@ trap 'trap - TERM INT; kill -- -$$ 2>/dev/null || true' TERM INT
 readonly USER_UID=$EUID
 readonly STAT=/usr/bin/stat
 readonly MKDIR=/usr/bin/mkdir
-readonly RM=/usr/bin/rm
-readonly MV=/usr/bin/mv
-readonly CP=/usr/bin/cp
 readonly REALPATH=/usr/bin/realpath
-readonly MKTEMP=/usr/bin/mktemp
-readonly CHMOD=/usr/bin/chmod
-readonly TOUCH=/usr/bin/touch
 readonly CAT=/usr/bin/cat
 readonly SLEEP=/usr/bin/sleep
 readonly READLINK=/usr/bin/readlink
 readonly GREP=/usr/bin/grep
 readonly AWK=/usr/bin/awk
 readonly DU=/usr/bin/du
-readonly CMP=/usr/bin/cmp
 readonly NUMFMT=/usr/bin/numfmt
 
 APP=fast-fruit-drive
@@ -217,11 +210,14 @@ ensure_dir() {
   return 0
 }
 
-# Recursive delete only when every component is a real user-or-root-owned
-# directory (no symlinks anywhere) and the resolved path stays under the
-# resolved home directory — a planted symlink is refused, not followed.
+# Recursive delete, descriptor-relative. The chain is validated first
+# (no symlinks, under the resolved home), then the PARENT directory is
+# pinned and the tree is wiped through inherited dir FDs: os.open with
+# O_NOFOLLOW|O_DIRECTORY at every level, os.unlink/os.rmdir with dir_fd —
+# no pathname is re-resolved, and a swap between validation and deletion
+# cannot redirect the delete.
 safe_rm_rf() {
-  local path="$1" real_home real_path
+  local path="$1" real_home real_path parent rc=0
   [[ -L $path ]] && return 1
   [[ -e $path ]] || return 0
   real_home=$($REALPATH "$HOME")
@@ -229,7 +225,33 @@ safe_rm_rf() {
   [[ $real_path == "$real_home" || $real_path == "$real_home"/* ]] || return 1
   [[ $real_path == "$path" ]] || return 1
   safe_dir "$path" || return 1
-  $RM -rf -- "$real_path"
+  parent=${path%/*}
+  exec {rmfd}<"$parent" || return 1
+  "$BIN_PYTHON3" - "${path##*/}" "$rmfd" <<'PY' || rc=$?
+import os, sys
+name, parentfd = sys.argv[1], int(sys.argv[2])
+try:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parentfd)
+except NotADirectoryError:
+    os.unlink(name, dir_fd=parentfd)
+    sys.exit(0)
+except FileNotFoundError:
+    sys.exit(0)
+def wipe(fd):
+    for entry in os.scandir(fd):
+        if entry.is_dir(follow_symlinks=False):
+            child = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            wipe(child)
+            os.close(child)
+            os.rmdir(entry.name, dir_fd=fd)
+        else:
+            os.unlink(entry.name, dir_fd=fd)
+wipe(fd)
+os.close(fd)
+os.rmdir(name, dir_fd=parentfd)
+PY
+  exec {rmfd}<&-
+  return $rc
 }
 
 assert_coreutils() {
@@ -237,8 +259,7 @@ assert_coreutils() {
   # stat/readlink are the bootstrap for verified_exec itself.
   safe_exec "$STAT" || fail "refusing unverified tool: $STAT"
   safe_exec "$READLINK" || fail "refusing unverified tool: $READLINK"
-  for p in "$MKDIR" "$RM" "$MV" "$CP" "$REALPATH" "$MKTEMP" "$CHMOD" \
-           "$TOUCH" "$CAT" "$SLEEP" "$GREP" "$AWK" "$DU" "$CMP" "$NUMFMT"; do
+  for p in "$MKDIR" "$REALPATH" "$CAT" "$SLEEP" "$GREP" "$AWK" "$DU" "$NUMFMT"; do
     verified_exec "$p" >/dev/null || fail "refusing unverified tool: $p"
   done
 }
@@ -302,11 +323,54 @@ ensure_dirs() {
   done
 }
 
+# ---- Descriptor-relative state handling --------------------------------
+# Every write, read, and delete below resolves against a directory FD that
+# is pinned immediately after validation. The pinned descriptor retains the
+# validated directory's identity, so a pathname swap after validation
+# cannot redirect plugin state: nothing re-resolves a path. Leaf entries
+# are opened with O_NOFOLLOW and destinations are replaced atomically
+# (O_EXCL temp + rename), so a swapped symlink is refused or superseded
+# rather than followed. The pinned FDs are inherited by the python children
+# that perform the descriptor-relative work.
+
+# fd_write NAME DIRFD MODE — stdin becomes pinned-dir/NAME, atomically.
+# The script travels via -c so stdin carries the content being written.
+fd_write() {
+  local name="$1" dirfd="$2" mode="$3"
+  "$BIN_PYTHON3" -c '
+import os, sys
+name, dirfd, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3], 8)
+data = sys.stdin.buffer.read(1048577)
+if len(data) > 1048576:
+    sys.exit(2)
+tmp = ".ff-" + os.urandom(10).hex()
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dirfd)
+with os.fdopen(fd, "wb") as fh:
+    fh.write(data)
+os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+' "$name" "$dirfd" "$mode"
+}
+
+# fd_unlink DIRFD NAME... — remove leaf entries inside the pinned directory
+# (unlinkat never follows symlinks; missing entries are ignored).
+fd_unlink() {
+  local dirfd="$1"
+  shift
+  "$BIN_PYTHON3" - "$dirfd" "$@" <<'PY'
+import os, sys
+dirfd = int(sys.argv[1])
+for name in sys.argv[2:]:
+    try:
+        os.unlink(name, dir_fd=dirfd)
+    except OSError:
+        pass
+PY
+}
+
 save_config() {
   ensure_dirs
-  local tmp
-  tmp=$($MKTEMP "$CONFIG_DIR/.config.XXXXXX") || fail "cannot create temp config"
-  $CAT >"$tmp" <<EOF
+  exec {cfgfd}<"$CONFIG_DIR" || fail "cannot pin config directory"
+  fd_write "config" "$cfgfd" 600 <<EOF
 remote=$remote
 bind=$bind
 dav_host=$dav_host
@@ -315,8 +379,7 @@ cache_max_age=$cache_max_age
 display_name=$display_name
 vfs_cache_mode=$vfs_cache_mode
 EOF
-  $CHMOD 600 "$tmp"
-  $MV -f "$tmp" "$CONFIG_FILE" || { $RM -f "$tmp"; fail "cannot replace config"; }
+  exec {cfgfd}<&-
 }
 
 write_default_config() {
@@ -440,9 +503,9 @@ sys.exit(0 if token or cookies else 1)
 
 write_unit() {
   load_config
-  local tmp
-  tmp=$($MKTEMP "${UNIT_FILE%/*}/.fast-fruit-drive.XXXXXX") || fail "cannot create temp unit"
-  $CAT >"$tmp" <<EOF
+  ensure_dir "${UNIT_FILE%/*}" || fail "refusing to use unsafe unit directory"
+  exec {unitfd}<"${UNIT_FILE%/*}" || fail "cannot pin unit directory"
+  fd_write "$UNIT" "$unitfd" 644 <<EOF
 [Unit]
 Description=Fast Fruit Drive — rclone iCloud WebDAV for Nautilus
 After=network-online.target
@@ -467,39 +530,64 @@ SyslogIdentifier=$APP
 [Install]
 WantedBy=default.target
 EOF
-  $CHMOD 644 "$tmp"
-  $MV -f "$tmp" "$UNIT_FILE" || { $RM -f "$tmp"; fail "cannot replace unit"; }
+  exec {unitfd}<&-
   [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
   "$BIN_SYSTEMCTL" --user daemon-reload
   "$BIN_SYSTEMCTL" --user enable "$UNIT" >/dev/null
 }
 
-# Atomic bookmark rewrite: validated directory, same-filesystem temp
-# file, rename into place. $1 = line to append, or empty to only filter.
+# Atomic bookmark rewrite, entirely descriptor-relative against the
+# pinned gtk-3.0 directory: existing lines are read with O_NOFOLLOW
+# (capped at 1 MiB, owner-checked), our dav entries are filtered out, $1 is
+# appended if non-empty, and the result replaces the file atomically.
 rewrite_bookmarks() {
-  local append="${1:-}" dir tmp line
+  local append="${1:-}" dir rc=0
   dir=${BOOKMARKS%/*}
   ensure_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
-  if [[ -L $BOOKMARKS ]]; then
-    fail "refusing to touch symlink bookmarks file: $BOOKMARKS"
-  fi
-  if [[ ! -e $BOOKMARKS ]]; then
-    $TOUCH "$BOOKMARKS"
-    $CHMOD 600 "$BOOKMARKS"
-  fi
-  safe_file "$BOOKMARKS" || fail "refusing to touch unsafe bookmarks file: $BOOKMARKS"
-  tmp=$($MKTEMP "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp bookmarks file"
-  {
-    while IFS= read -r line || [[ -n $line ]]; do
-      if [[ $line == dav://* ]] && [[ $line == *"iCloud Drive" || $line == *"iCloud WebDAV" || $line == "$dav_uri"* || $line == "$old_uri"* ]]; then
-        continue
-      fi
-      printf '%s\n' "$line"
-    done <"$BOOKMARKS"
-    [[ -z $append ]] || printf '%s\n' "$append"
-  } >"$tmp" || { $RM -f "$tmp"; fail "cannot rewrite bookmarks"; }
-  $CHMOD 600 "$tmp"
-  $MV -f "$tmp" "$BOOKMARKS" || { $RM -f "$tmp"; fail "cannot replace bookmarks"; }
+  exec {bmfd}<"$dir" || fail "cannot pin bookmarks directory"
+  "$BIN_PYTHON3" - "$bmfd" "$dav_uri" "$old_uri" "$append" <<'PY' || rc=$?
+import os, stat, sys
+dirfd, dav_uri, old_uri, append = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+existing = b""
+fd = None
+try:
+    fd = os.open("bookmarks", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+except FileNotFoundError:
+    fd = None
+except OSError:
+    sys.exit(2)
+if fd is not None:
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (os.getuid(), 0) or st.st_size > 1048576:
+            sys.exit(2)
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk or len(existing) > 1048576:
+                break
+            existing += chunk
+        if len(existing) > 1048576:
+            sys.exit(2)
+    finally:
+        os.close(fd)
+lines = existing.decode("utf-8", "replace").splitlines()
+keep = [
+    l for l in lines
+    if not (l.startswith("dav://") and (
+        "iCloud Drive" in l or "iCloud WebDAV" in l
+        or l.startswith(dav_uri) or l.startswith(old_uri)))
+]
+if append:
+    keep.append(append)
+data = ("\n".join(keep) + "\n").encode("utf-8", "replace") if keep else b""
+tmp = ".ff-" + os.urandom(10).hex()
+wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+with os.fdopen(wfd, "wb") as fh:
+    fh.write(data)
+os.rename(tmp, "bookmarks", src_dir_fd=dirfd, dst_dir_fd=dirfd)
+PY
+  exec {bmfd}<&-
+  [[ $rc -eq 0 ]] || fail "cannot rewrite bookmarks safely"
 }
 
 ensure_bookmark() {
@@ -548,19 +636,60 @@ cache_bytes() {
 }
 
 install_nautilus_extension() {
-  local src dest dir tmp
+  local src dir rc=0
   src="$PLUGIN_DIR/nautilus/fast_fruit_drive_nautilus.py"
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
-  dest="$dir/fast_fruit_drive_nautilus.py"
   [[ -f $src ]] || return 0
   ensure_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
-  [[ ! -L $dest ]] || fail "refusing to replace symlink: $dest"
-  if [[ ! -f $dest ]] || ! $CMP -s "$src" "$dest"; then
-    tmp=$($MKTEMP "$dir/.fast-fruit-drive.XXXXXX") || fail "cannot create temp extension file"
-    $CP "$src" "$tmp" || { $RM -f "$tmp"; fail "cannot copy Nautilus extension"; }
-    $CHMOD 644 "$tmp"
-    $MV -f "$tmp" "$dest" || { $RM -f "$tmp"; fail "cannot replace Nautilus extension"; }
-  fi
+  exec {extfd}<"$dir" || fail "cannot pin extension directory"
+  "$BIN_PYTHON3" - "$src" "$extfd" <<'PY' || rc=$?
+import os, stat, sys
+src, dirfd = sys.argv[1], int(sys.argv[2])
+sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    st = os.fstat(sfd)
+    if not stat.S_ISREG(st.st_mode) or st.st_size > 2097152:
+        sys.exit(2)
+    data = b""
+    while True:
+        chunk = os.read(sfd, 65536)
+        if not chunk or len(data) > 2097152:
+            break
+        data += chunk
+finally:
+    os.close(sfd)
+if len(data) > 2097152:
+    sys.exit(2)
+existing = None
+try:
+    efd = os.open("fast_fruit_drive_nautilus.py", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+except FileNotFoundError:
+    efd = None
+except OSError:
+    sys.exit(2)
+if efd is not None:
+    try:
+        st = os.fstat(efd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (os.getuid(), 0) or st.st_size > 2097152:
+            sys.exit(2)
+        existing = b""
+        while True:
+            chunk = os.read(efd, 65536)
+            if not chunk or len(existing) > 2097152:
+                break
+            existing += chunk
+    finally:
+        os.close(efd)
+if existing == data:
+    sys.exit(0)
+tmp = ".ff-" + os.urandom(10).hex()
+wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dirfd)
+with os.fdopen(wfd, "wb") as fh:
+    fh.write(data)
+os.rename(tmp, "fast_fruit_drive_nautilus.py", src_dir_fd=dirfd, dst_dir_fd=dirfd)
+PY
+  exec {extfd}<&-
+  [[ $rc -eq 0 ]] || fail "cannot install Nautilus extension safely"
 }
 
 # Abort before writing anything unless every required package is present.
@@ -829,16 +958,33 @@ remove_bookmark() {
 }
 
 remove_nautilus_extension() {
-  local dir dest pyc
+  local dir rc=0
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
-  dest="$dir/fast_fruit_drive_nautilus.py"
-  if [[ -e $dest || -L $dest ]]; then
-    $RM -f -- "$dest"
-  fi
-  for pyc in "$dir/__pycache__/fast_fruit_drive_nautilus"*.pyc; do
-    [[ -e $pyc || -L $pyc ]] || continue
-    $RM -f -- "$pyc"
-  done
+  ensure_dir "$dir" 2>/dev/null || return 0
+  exec {extfd}<"$dir" 2>/dev/null || return 0
+  "$BIN_PYTHON3" - "$extfd" <<'PY' || rc=$?
+import os, sys
+dirfd = int(sys.argv[1])
+try:
+    os.unlink("fast_fruit_drive_nautilus.py", dir_fd=dirfd)
+except OSError:
+    pass
+try:
+    pycfd = os.open("__pycache__", os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dirfd)
+except OSError:
+    sys.exit(0)
+try:
+    for entry in os.scandir(pycfd):
+        if entry.name.startswith("fast_fruit_drive_nautilus"):
+            try:
+                os.unlink(entry.name, dir_fd=pycfd)
+            except OSError:
+                pass
+finally:
+    os.close(pycfd)
+PY
+  exec {extfd}<&-
+  return $rc
 }
 
 cmd_uninstall() {
@@ -846,8 +992,20 @@ cmd_uninstall() {
   if [[ -n $BIN_SYSTEMCTL ]]; then
     "$BIN_SYSTEMCTL" --user disable --now "$UNIT" >/dev/null 2>&1 || true
   fi
-  $RM -f -- "$UNIT_FILE"
-  $RM -f -- "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants/$UNIT"
+  local wants_dir
+  if ensure_dir "${UNIT_FILE%/*}" 2>/dev/null; then
+    if exec {undfd}<"${UNIT_FILE%/*}"; then
+      fd_unlink "$undfd" "$UNIT"
+      exec {undfd}<&-
+    fi
+  fi
+  wants_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants"
+  if ensure_dir "$wants_dir" 2>/dev/null; then
+    if exec {wfd}<"$wants_dir"; then
+      fd_unlink "$wfd" "$UNIT"
+      exec {wfd}<&-
+    fi
+  fi
   if [[ -n $BIN_SYSTEMCTL ]]; then
     "$BIN_SYSTEMCTL" --user reset-failed "$UNIT" >/dev/null 2>&1 || true
     "$BIN_SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
