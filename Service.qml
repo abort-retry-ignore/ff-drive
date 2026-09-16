@@ -20,7 +20,7 @@ Item {
   property bool refreshing: false
   property string statusText: "Checking…"
   property string remote: "icloud:"
-  property string uri: "dav://127.0.0.1:8080/"
+  property string uri: "dav://ff-drive@iCloud.localhost:8080/"
   property string displayName: "iCloud Drive"
   property string cacheMaxSize: "4G"
   property string cacheMaxAge: "24h"
@@ -45,32 +45,38 @@ Item {
   property bool _statusOverflow: false
   property bool _controlOverflow: false
 
-  // Live byte ceiling for helper output; the status JSON is ~500 B, so this
-  // only ever trips when something is very wrong.
+  // The helper's own __supervise command caps stdout/stderr at this many
+  // raw bytes each *before* any line parsing happens (see run_bounded() in
+  // bin/fast-fruit-drive), so this is a belt-and-suspenders duplicate of a
+  // guarantee that already holds by the time SplitParser ever sees a byte.
   readonly property int outputCap: 65536
+  readonly property int statusSuperviseSec: 12
+  readonly property int controlSuperviseSec: 40
 
-  // Each helper call runs in its own session (setsid) with both output
-  // streams hard-cut at the raw-byte level BEFORE any delimiter buffering
-  // (head -c), so an unterminated producer can never accumulate inside the
-  // parser beyond the cap. The wrapper reports its session-leader pid as
-  // an "FFPID:" stderr line so the watchdogs can terminate the entire
-  // private process group explicitly, whatever the shell's own kill does.
-  readonly property string setsidPath: "/usr/bin/setsid"
-  readonly property string bashPath: "/usr/bin/bash"
-  readonly property string headPath: "/usr/bin/head"
-  readonly property string killPath: "/usr/bin/kill"
-  readonly property string capScript: "printf 'FFPID:%s\\n' \"$$\" >&2; trap 'trap - TERM INT; kill -- -$$ 2>/dev/null' TERM INT; set -o pipefail; exec 2> >('" + headPath + "' -c " + outputCap + " >&2); \"$@\" | " + headPath + " -c " + outputCap
-  property int _statusPgid: 0
-  property int _controlPgid: 0
+  readonly property string pythonPath: "/usr/bin/python3"
 
-  function wrappedCommand(args) {
-    return [setsidPath, bashPath, "-p", "-c", capScript, "ff", helperPath].concat(args)
-  }
+  // Every helper invocation is python3 -I (isolated mode: ignores all
+  // PYTHON* environment variables and the user site directory) running
+  // __supervise, which itself launches the real command in its own
+  // session with a hand-picked environment, a raw-byte output cap, and a
+  // wall-clock deadline — see run_bounded()/cmd_supervise() in
+  // bin/fast-fruit-drive. Quickshell's own Process.environment merges
+  // with the inherited environment rather than replacing it (there is no
+  // API to read the inherited values, e.g. DBUS_SESSION_BUS_ADDRESS, to
+  // reconstruct a full allow-list here), so loader/interpreter injection
+  // vectors are neutralized by explicit override instead: LD_PRELOAD and
+  // friends are blanked before the interpreter that will run __supervise
+  // is even exec'd, and __supervise's own child gets the strict allow-list.
+  readonly property var baseEnvironment: ({
+    "PATH": "/usr/bin",
+    "BASH_ENV": "", "ENV": "",
+    "PYTHONPATH": "", "PYTHONHOME": "", "PYTHONSTARTUP": "", "PYTHONINSPECT": "",
+    "LD_PRELOAD": "", "LD_LIBRARY_PATH": "", "LD_AUDIT": "",
+    "GIO_EXTRA_MODULES": "", "GI_TYPELIB_PATH": "", "GSETTINGS_BACKEND": "", "GIO_USE_VFS": ""
+  })
 
-  function killGroup(pgid) {
-    if (pgid <= 0) return
-    groupKillProcess.command = [killPath, "-TERM", "--", "-" + String(pgid)]
-    groupKillProcess.running = true
+  function wrappedCommand(args, timeoutSeconds) {
+    return [pythonPath, "-I", helperPath, "__supervise", String(timeoutSeconds)].concat(args)
   }
 
   function collectStatusOut(line) {
@@ -84,11 +90,6 @@ Item {
   }
 
   function collectStatusErr(line) {
-    if (_statusPgid === 0 && line.indexOf("FFPID:") === 0) {
-      var pid = parseInt(line.substring(6), 10)
-      if (pid > 0) _statusPgid = pid
-      return
-    }
     if (_statusOverflow) return
     if (_statusError.length + line.length + 1 > outputCap) {
       _statusOverflow = true
@@ -109,11 +110,6 @@ Item {
   }
 
   function collectControlErr(line) {
-    if (_controlPgid === 0 && line.indexOf("FFPID:") === 0) {
-      var pid = parseInt(line.substring(6), 10)
-      if (pid > 0) _controlPgid = pid
-      return
-    }
     if (_controlOverflow) return
     if (_controlError.length + line.length + 1 > outputCap) {
       _controlOverflow = true
@@ -151,9 +147,8 @@ Item {
     _statusOutput = ""
     _statusError = ""
     _statusOverflow = false
-    _statusPgid = 0
     refreshing = true
-    statusProcess.command = root.wrappedCommand(["status"])
+    statusProcess.command = root.wrappedCommand(["status"], statusSuperviseSec)
     statusProcess.running = true
   }
 
@@ -169,7 +164,7 @@ Item {
     gvfsDav = parsed.gvfsDav === true
     statusText = String(parsed.statusText || (running ? "Connected" : "Stopped"))
     remote = String(parsed.remote || "icloud:")
-    uri = String(parsed.uri || "dav://127.0.0.1:8080/")
+    uri = String(parsed.uri || "dav://ff-drive@iCloud.localhost:8080/")
     displayName = String(parsed.displayName || "iCloud Drive")
     cacheMaxSize = String(parsed.cacheMaxSize || settingCacheMaxSize)
     cacheMaxAge = String(parsed.cacheMaxAge || (settingCacheMaxAgeHours + "h"))
@@ -189,8 +184,7 @@ Item {
     _controlOutput = ""
     _controlError = ""
     _controlOverflow = false
-    _controlPgid = 0
-    controlProcess.command = root.wrappedCommand(args)
+    controlProcess.command = root.wrappedCommand(args, controlSuperviseSec)
     controlProcess.running = true
   }
 
@@ -208,9 +202,9 @@ Item {
     runControl([
       "configure",
       "cache_max_size=" + settingCacheMaxSize,
-      "cache_max_age=" + settingCacheMaxAgeHours + "h",
+      "cache_max_age_hours=" + settingCacheMaxAgeHours,
       "restart=1"
-    ])
+    ], undefined)
   }
 
   onSettingCacheMaxSizeChanged: applySettings()
@@ -239,15 +233,20 @@ Item {
     onTriggered: root.actionStatus = ""
   }
 
+  // __supervise itself always returns within statusSuperviseSec/
+  // controlSuperviseSec plus a couple of seconds of its own cleanup grace;
+  // these watchdogs are a backstop for the case the supervisor process
+  // itself wedges (a bug, not normal operation), and kill the exact PID
+  // Quickshell handed us — no process-group guessing, no PID parsed out
+  // of stderr: Quickshell's Process.processId is the real pid, and
+  // Process.signal() delivers a real signal to it.
   Timer {
     id: statusWatchdog
-    interval: 15000
+    interval: (root.statusSuperviseSec + 6) * 1000
     repeat: false
     running: statusProcess.running
     onTriggered: {
-      root.killGroup(root._statusPgid)
-      root._statusPgid = 0
-      statusProcess.running = false
+      if (statusProcess.processId) statusProcess.signal(9)
       root.refreshing = false
       root.lastError = "Fast Fruit Drive status timed out"
     }
@@ -255,13 +254,11 @@ Item {
 
   Timer {
     id: controlWatchdog
-    interval: 45000
+    interval: (root.controlSuperviseSec + 6) * 1000
     repeat: false
     running: controlProcess.running
     onTriggered: {
-      root.killGroup(root._controlPgid)
-      root._controlPgid = 0
-      controlProcess.running = false
+      if (controlProcess.processId) controlProcess.signal(9)
       root._desired = -1
       root.lastError = "Fast Fruit Drive command timed out"
       root.actionStatus = root.lastError
@@ -288,20 +285,15 @@ Item {
   }
 
   Process {
-    id: groupKillProcess
-    running: false
-    command: []
-  }
-
-  Process {
     id: statusProcess
     running: false
     command: []
+    clearEnvironment: false
+    environment: root.baseEnvironment
     stdout: SplitParser { onRead: function(line) { root.collectStatusOut(line) } }
     stderr: SplitParser { onRead: function(line) { root.collectStatusErr(line) } }
     onExited: function(exitCode) {
       root.refreshing = false
-      root._statusPgid = 0
       if (root._statusOverflow) {
         root._statusOverflow = false
         root.lastError = "Fast Fruit Drive status output exceeded safety limit"
@@ -316,10 +308,11 @@ Item {
     id: controlProcess
     running: false
     command: []
+    clearEnvironment: false
+    environment: root.baseEnvironment
     stdout: SplitParser { onRead: function(line) { root.collectControlOut(line) } }
     stderr: SplitParser { onRead: function(line) { root.collectControlErr(line) } }
     onExited: function(exitCode) {
-      root._controlPgid = 0
       if (root._controlOverflow) {
         root._controlOverflow = false
         root._desired = -1

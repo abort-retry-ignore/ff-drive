@@ -441,7 +441,7 @@ Panel {
                 textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: root.clearArmed
-                  ? "Interrupts transfers, discards pending uploads"
+                  ? "Refuses if uploads are pending"
                   : Model.cacheText(drive.cacheUsedBytes, drive.cacheMaxSize)
                 color: root.dim
                 font.family: root.fontFamily
