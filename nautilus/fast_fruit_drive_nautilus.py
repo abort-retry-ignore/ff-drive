@@ -10,12 +10,21 @@ hydrates or evicts a file, so cloud-only → cached transitions update live.
 Dirty (uploading):     emblem-synchronizing
 Cached and uploaded:   emblem-default
 Cloud-only:            emblem-documents
+
+The cache root, remote name, and DAV host/port are fixed constants that
+match the plugin's own helper exactly (bin/fast-fruit-drive). There is no
+configuration file read here: a config value has no business steering which
+filesystem paths this extension trusts, and previous versions of this file
+that read cache_dir/remote/dav_host from config accepted values that let a
+crafted URI walk outside the cache root.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import pwd
+import stat
 import time
 from urllib.parse import unquote
 
@@ -25,10 +34,14 @@ require_version("Nautilus", "4.1")
 
 from gi.repository import Gio, GLib, GObject, Nautilus  # noqa: E402
 
-CONFIG = os.path.expanduser("~/.config/fast-fruit-drive/config")
-DEFAULT_CACHE = os.path.expanduser("~/.cache/fast-fruit-drive")
-DEFAULT_REMOTE = "icloud"
-DAV_HOSTS = {"icloud.localhost", "127.0.0.1", "localhost", "::1"}
+HOME = pwd.getpwuid(os.getuid()).pw_dir
+CACHE_DIR = os.path.join(HOME, ".cache", "fast-fruit-drive")
+REMOTE_NAME = "icloud"
+DAV_HOST = "icloud.localhost"
+DAV_PORT = 8080
+WEBDAV_USER = "ff-drive"
+META_ROOT = os.path.join(CACHE_DIR, "vfsMeta", REMOTE_NAME)
+VFS_ROOT = os.path.join(CACHE_DIR, "vfs", REMOTE_NAME)
 
 EMBLEM = {
     "dirty": "emblem-synchronizing",
@@ -36,77 +49,75 @@ EMBLEM = {
     "remote": "emblem-documents",
 }
 
-_cfg = None
-_cfg_at = 0.0
-_watched_dirty: set[str] = set()
-_dirty_dirs: set[str] = set()
-
-# Live emblem refresh: rows we have displayed, keyed by their path relative to
-# the remote root, and one cache-directory monitor per displayed folder. When
-# rclone hydrates or evicts a file, the monitor invalidates that row's
-# extension info and Nautilus re-asks for the emblem — no manual reload.
-_rows: dict[str, object] = {}
-_row_monitors: dict[str, object] = {}
+MAX_META_FILE = 262_144
 _ROWS_CAP = 4096
 _MONITORS_CAP = 128
+_DEBOUNCE_SECONDS = 0.25
+
+_watched_dirty: set[str] = set()
+_dirty_dirs: set[str] = set()
+_rows: dict[str, object] = {}
+_row_monitors: dict[str, object] = {}
+_pending_invalidate: dict[str, float] = {}
 
 
-def _load_config() -> dict:
-    global _cfg, _cfg_at
-    now = time.monotonic()
-    if _cfg is not None and now - _cfg_at < 5:
-        return _cfg
-    out = {"cache": DEFAULT_CACHE, "remote": DEFAULT_REMOTE, "dav_host": "icloud.localhost"}
-    try:
-        with open(CONFIG, encoding="utf-8", errors="replace") as fh:
-            blob = fh.read(65537)
-        if len(blob) > 65536:
-            blob = ""
-        for line in blob.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            if key == "cache_dir":
-                out["cache"] = os.path.expanduser(value)
-            elif key == "remote":
-                out["remote"] = value.rstrip(":").split("/")[0]
-            elif key == "dav_host":
-                out["dav_host"] = value.lower()
-    except OSError:
-        pass
-    hosts = set(DAV_HOSTS)
-    hosts.add(out["dav_host"])
-    out["hosts"] = hosts
-    remote = out["remote"]
-    cache = out["cache"]
-    out["meta_root"] = os.path.join(cache, "vfsMeta", remote)
-    out["vfs_root"] = os.path.join(cache, "vfs", remote)
-    _cfg, _cfg_at = out, now
-    return out
+def _valid_rel_component(name: str) -> bool:
+    if not name or name in (".", ".."):
+        return False
+    if "/" in name or "\x00" in name:
+        return False
+    return all(ord(ch) >= 32 for ch in name)
 
 
-def _rel_from_uri(uri: str) -> str | None:
+def _valid_rel_path(rel: str) -> bool:
+    if rel == "":
+        return True
+    return all(_valid_rel_component(part) for part in rel.split("/"))
+
+
+def _rel_from_uri(uri: str) -> "str | None":
+    """Return the path relative to the fixed cache root that `uri` names,
+    or None if it does not name a path under our own DAV mount at all.
+    Every path component is validated: no '..', no empty segments, no
+    control characters — a crafted URI cannot walk outside the root."""
     if not uri:
         return None
-    cfg = _load_config()
     if uri.startswith("dav://"):
-        rest = uri[6:]
-        hostpart, _, path = rest.partition("/")
-        host = hostpart.rsplit("@", 1)[-1].split(":")[0].lower()
-        if host not in cfg["hosts"]:
+        rest = uri[len("dav://"):]
+        hostport, _, raw_path = rest.partition("/")
+        userinfo, _, hostport = hostport.rpartition("@")
+        host, _, port_text = hostport.partition(":")
+        host = host.lower()
+        if host != DAV_HOST:
             return None
-        return unquote(path).strip("/")
-    needle = "/gvfs/dav:host="
-    idx = uri.find(needle)
-    if idx < 0:
+        if port_text and port_text != str(DAV_PORT):
+            return None
+        if userinfo and userinfo != WEBDAV_USER:
+            return None
+        rel = unquote(raw_path).strip("/")
+    else:
+        needle = "/gvfs/dav:host="
+        idx = uri.find(needle)
+        if idx < 0:
+            return None
+        rest = unquote(uri[idx + len(needle):])
+        hostpart, _, rel = rest.partition("/")
+        items = hostpart.split(",")
+        host = items[0].lower()
+        fields = {}
+        for item in items[1:]:
+            key, _, value = item.partition("=")
+            fields[key] = value
+        if host != DAV_HOST:
+            return None
+        if "port" in fields and fields["port"] != str(DAV_PORT):
+            return None
+        if "user" in fields and fields["user"] != WEBDAV_USER:
+            return None
+        rel = rel.strip("/")
+    if not _valid_rel_path(rel):
         return None
-    rest = unquote(uri[idx + len(needle) :])
-    hostpart, _, rel = rest.partition("/")
-    host = hostpart.split(",", 1)[0].lower()
-    if host not in cfg["hosts"]:
-        return None
-    return rel.strip("/")
+    return rel
 
 
 def _parents(rel: str) -> list[str]:
@@ -125,25 +136,120 @@ def _rebuild_dirty_dirs() -> None:
     _dirty_dirs = dirs
 
 
-def _read_one(rel: str) -> str:
-    cfg = _load_config()
-    meta_path = os.path.join(cfg["meta_root"], rel) if rel else cfg["meta_root"]
-    vfs_path = os.path.join(cfg["vfs_root"], rel) if rel else cfg["vfs_root"]
-    if rel and os.path.isfile(meta_path):
+def _open_bounded(root: str, rel: str, *, max_bytes: int):
+    """Open root/rel component-by-component with O_NOFOLLOW, refusing
+    symlinks and group/world-writable directories at every level, then
+    return at most max_bytes of the leaf's content (None if missing, not a
+    plain file owned by us, or oversized)."""
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        parts = [p for p in rel.split("/") if p] if rel else []
+        for part in parts[:-1]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                os.close(fd)
+                return None
+            os.close(fd)
+            fd = nxt
+        leaf = parts[-1] if parts else None
+        if leaf is None:
+            return None
         try:
-            if os.path.getsize(meta_path) > 262144:
-                # Bounded reads: oversized metadata is never parsed.
-                return "cached"
-            with open(meta_path, encoding="utf-8", errors="replace") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        if data.get("Dirty") is True:
-            return "dirty"
+            leaf_fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            return None
+        try:
+            st = os.fstat(leaf_fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                return None
+            if st.st_size > max_bytes:
+                return None
+            data = bytearray()
+            while True:
+                chunk = os.read(leaf_fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    return None
+            return bytes(data)
+        finally:
+            os.close(leaf_fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _dir_exists_no_follow(root: str, rel: str) -> bool:
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        parts = [p for p in rel.split("/") if p] if rel else []
+        for part in parts:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return False
+            os.close(fd)
+            fd = nxt
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _leaf_exists_lexists(root: str, rel: str) -> bool:
+    if not rel:
+        return False
+    parent_rel, _, leaf = rel.rpartition("/")
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        for part in ([p for p in parent_rel.split("/") if p] if parent_rel else []):
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return False
+            os.close(fd)
+            fd = nxt
+        try:
+            os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+            return True
+        except OSError:
+            return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _read_one(rel: str) -> str:
+    if rel:
+        data = _open_bounded(META_ROOT, rel, max_bytes=MAX_META_FILE)
+        if data is not None:
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                obj = {}
+            if isinstance(obj, dict) and obj.get("Dirty") is True:
+                return "dirty"
+            return "cached"
+    if _dir_exists_no_follow(VFS_ROOT, rel):
         return "cached"
-    if os.path.isdir(vfs_path):
-        return "cached"
-    if rel and os.path.lexists(vfs_path):
+    if rel and _leaf_exists_lexists(VFS_ROOT, rel):
         return "cached"
     return "remote"
 
@@ -175,17 +281,20 @@ def _remember_row(rel: str, file_info) -> None:
     _rows[rel] = file_info
 
 
-def _ensure_monitor(cfg: dict, dir_rel: str) -> None:
+def _ensure_monitor(dir_rel: str) -> None:
     if dir_rel in _row_monitors:
         return
     if len(_row_monitors) >= _MONITORS_CAP:
         for monitor in _row_monitors.values():
             monitor.cancel()
         _row_monitors.clear()
-    cache_dir = os.path.join(cfg["vfs_root"], dir_rel) if dir_rel else cfg["vfs_root"]
-    if not os.path.isdir(cache_dir):
+    if not _dir_exists_no_follow(VFS_ROOT, dir_rel):
         return
+    cache_dir = os.path.join(VFS_ROOT, dir_rel) if dir_rel else VFS_ROOT
     try:
+        # Real (post-validation) path: the checks above already proved
+        # every component down to dir_rel is a non-symlinked directory
+        # under VFS_ROOT that we own; nothing is re-resolved afterwards.
         monitor = Gio.File.new_for_path(cache_dir).monitor_directory(Gio.FileMonitorFlags.NONE)
     except Exception:
         return
@@ -208,6 +317,19 @@ def _invalidate_row(rel: str) -> None:
         _rows.pop(rel, None)
 
 
+def _flush_invalidate(rel: str) -> bool:
+    _pending_invalidate.pop(rel, None)
+    _invalidate_row(rel)
+    return False
+
+
+def _debounced_invalidate(rel: str) -> None:
+    if rel in _pending_invalidate:
+        return
+    _pending_invalidate[rel] = time.monotonic()
+    GLib.timeout_add(int(_DEBOUNCE_SECONDS * 1000), _flush_invalidate, rel)
+
+
 def _on_cache_changed(monitor, gfile, other_file, event_type, dir_rel) -> None:
     if event_type not in (
         Gio.FileMonitorEvent.CREATED,
@@ -215,31 +337,31 @@ def _on_cache_changed(monitor, gfile, other_file, event_type, dir_rel) -> None:
         Gio.FileMonitorEvent.ATTRIBUTE_CHANGED,
         Gio.FileMonitorEvent.DELETED,
         Gio.FileMonitorEvent.MOVED,
+        Gio.FileMonitorEvent.MOVED_IN,
+        Gio.FileMonitorEvent.MOVED_OUT,
     ):
         return
     name = gfile.get_basename() if gfile is not None else None
-    if name:
+    if name and _valid_rel_component(name):
         child_rel = f"{dir_rel}/{name}" if dir_rel else name
-        _invalidate_row(child_rel)
-        # A directory appearing in the cache means its contents just started
-        # hydrating: attach its monitor now so the files inside it are seen.
-        if event_type == Gio.FileMonitorEvent.CREATED:
-            _ensure_monitor(_load_config(), child_rel)
+        _debounced_invalidate(child_rel)
+        if event_type in (Gio.FileMonitorEvent.CREATED, Gio.FileMonitorEvent.MOVED_IN):
+            _ensure_monitor(child_rel)
     if event_type == Gio.FileMonitorEvent.MOVED and other_file is not None:
         other = other_file.get_basename()
-        if other:
-            _invalidate_row(f"{dir_rel}/{other}" if dir_rel else other)
+        if other and _valid_rel_component(other):
+            _debounced_invalidate(f"{dir_rel}/{other}" if dir_rel else other)
     if monitor.is_cancelled():
         _row_monitors.pop(dir_rel, None)
 
 
-def _register_row(cfg: dict, rel: str, file_info) -> None:
+def _register_row(rel: str, file_info) -> None:
     """Track a displayed row and watch the cache dir of the folder listing it."""
     _remember_row(rel, file_info)
     if file_info.is_directory():
-        _ensure_monitor(cfg, rel)
+        _ensure_monitor(rel)
     parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-    _ensure_monitor(cfg, parent)
+    _ensure_monitor(parent)
 
 
 class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
@@ -252,7 +374,7 @@ class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         rel = _rel_from_uri(uri)
         if rel is None:
             return
-        _register_row(_load_config(), rel, file_info)
+        _register_row(rel, file_info)
         _apply_emblem(file_info, _status(rel, file_info.is_directory()))
 
     def update_file_info_full(self, provider, handle, closure, file_info):
@@ -260,7 +382,7 @@ class FastFruitDriveInfoProvider(GObject.GObject, Nautilus.InfoProvider):
         rel = _rel_from_uri(uri)
         if rel is None:
             return Nautilus.OperationResult.COMPLETE
-        _register_row(_load_config(), rel, file_info)
+        _register_row(rel, file_info)
         st = _status(rel, file_info.is_directory())
         _apply_emblem(file_info, st)
         if st != "dirty" or file_info.is_directory():
