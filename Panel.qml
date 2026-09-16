@@ -237,7 +237,7 @@ Panel {
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
             function setupText() {
-              if (!drive.rcloneFound) return "Install rclone and put it on PATH."
+              if (!drive.rcloneFound) return "Install rclone: omarchy pkg add rclone"
               if (drive.needsLogin) return "Sign in with your Apple ID password and 2FA. rclone keeps a trust token for about 30 days, then you sign in again. App-specific passwords are not accepted."
               if (!drive.gvfsDav) return "Install gvfs-dnssd so Nautilus can speak WebDAV."
               return "Fast Fruit Drive is not ready yet."

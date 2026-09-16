@@ -36,6 +36,17 @@ omarchy plugin remove io.github.abort-retry-ignore.ff-drive
 Both packages come from the official repositories. This plugin never
 downloads or executes remote installers.
 
+## Local WebDAV authentication
+
+The localhost WebDAV server requires a random per-install credential. Its
+plaintext password and htpasswd hash are stored in
+`~/.config/fast-fruit-drive/` with mode 600. The password is supplied to GVFS
+in memory: it is never placed in the DAV URI, GTK bookmark, process arguments,
+or journal, and it is unrelated to your Apple password.
+
+Before supplying the credential, the helper verifies that both loopback
+listeners belong to the systemd unit's current rclone MainPID.
+
 ## Sign-in and token expiry
 
 iCloud login is **rclone's**, not this plugin's. The widget's **Sign in** button
@@ -108,16 +119,20 @@ Starting the drive (explicit toggle or `start`) writes only:
 - a GTK bookmark named **iCloud Drive**
 - a Nautilus Python extension copy
 - this plugin's config file, if missing
+- a random local WebDAV password and its htpasswd hash
 
 ## Safety
 
 - No rclone purge/delete flags
 - Cache eviction is local only
 - Binds to `127.0.0.1` / `::1` only (enforced by validation)
+- Local WebDAV requires a random credential; unauthenticated requests receive 401
+- Listener ownership is verified against the rclone systemd MainPID before
+  GVFS receives the password
 - No sudo or pkexec
 - Does not overwrite `rclone.conf`
-- rclone, python3, systemctl, gio, curl, nautilus, jq and coreutils are
-  resolved as verified absolute executables; the service PATH is `/usr/bin`
+- rclone, python3, systemctl, gio, nautilus, jq and coreutils are resolved as
+  verified absolute executables; the service PATH is `/usr/bin`
 - Directories are created component-wise with no-follow ancestor checks;
   config, unit, and bookmark writes are atomic and replace only validated,
   symlink-free paths; cache deletion refuses symlinked paths

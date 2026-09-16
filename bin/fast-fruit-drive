@@ -1,6 +1,11 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -p
 # Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
 set -euo pipefail
+
+# Privileged Bash mode ignores BASH_ENV and imported shell functions. Remove
+# interpreter/loader injection variables before spawning any child process.
+unset BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
+unset LD_PRELOAD LD_LIBRARY_PATH
 
 # Closed environment: user-writable PATH entries are never consulted.
 # Named tools are still resolved as verified absolute executables below.
@@ -36,6 +41,8 @@ CONFIG_FILE="$CONFIG_DIR/config"
 UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
 BOOKMARKS="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookmarks"
 RCLONE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/rclone/rclone.conf"
+WEBDAV_AUTH_HELPER="$HERE/fast-fruit-drive-auth.py"
+readonly WEBDAV_USER=ff-drive
 
 DEFAULT_REMOTE="icloud:"
 DEFAULT_BIND="127.0.0.1:8080"
@@ -48,7 +55,6 @@ DEFAULT_VFS_CACHE_MODE="full"
 BIN_PYTHON3=
 BIN_SYSTEMCTL=
 BIN_GIO=
-BIN_CURL=
 BIN_JQ=
 BIN_NAUTILUS=
 BIN_SETSID=
@@ -227,7 +233,7 @@ safe_rm_rf() {
   safe_dir "$path" || return 1
   parent=${path%/*}
   exec {rmfd}<"$parent" || return 1
-  "$BIN_PYTHON3" - "${path##*/}" "$rmfd" <<'PY' || rc=$?
+  "$BIN_PYTHON3" -I - "${path##*/}" "$rmfd" <<'PY' || rc=$?
 import os, sys
 name, parentfd = sys.argv[1], int(sys.argv[2])
 try:
@@ -269,7 +275,6 @@ resolve_tools() {
   BIN_PYTHON3=$(find_verified python3 || true)
   BIN_SYSTEMCTL=$(find_verified systemctl || true)
   BIN_GIO=$(find_verified gio || true)
-  BIN_CURL=$(find_verified curl || true)
   BIN_JQ=$(find_verified jq || true)
   BIN_NAUTILUS=$(find_verified nautilus || true)
   BIN_SETSID=$(find_verified setsid || true)
@@ -337,7 +342,7 @@ ensure_dirs() {
 # The script travels via -c so stdin carries the content being written.
 fd_write() {
   local name="$1" dirfd="$2" mode="$3"
-  "$BIN_PYTHON3" -c '
+  "$BIN_PYTHON3" -I -c '
 import os, sys
 name, dirfd, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3], 8)
 data = sys.stdin.buffer.read(1048577)
@@ -356,7 +361,7 @@ os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
 fd_unlink() {
   local dirfd="$1"
   shift
-  "$BIN_PYTHON3" - "$dirfd" "$@" <<'PY'
+  "$BIN_PYTHON3" -I - "$dirfd" "$@" <<'PY'
 import os, sys
 dirfd = int(sys.argv[1])
 for name in sys.argv[2:]:
@@ -460,7 +465,9 @@ load_config() {
     vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
   fi
   port=${bind##*:}
-  dav_uri="dav://${dav_host}:${port}/"
+  dav_uri="dav://${WEBDAV_USER}@${dav_host}:${port}/"
+  legacy_uri="dav://${dav_host}:${port}/"
+  old_auth_uri="dav://${WEBDAV_USER}@127.0.0.1:${port}/"
   old_uri="dav://127.0.0.1:${port}/"
 }
 
@@ -482,7 +489,7 @@ session_present() {
   [[ -f $RCLONE_CONF && ! -L $RCLONE_CONF ]] || return 1
   sz=$($STAT -c '%s' "$RCLONE_CONF" 2>/dev/null || echo 1048577)
   [[ 10#$sz -le 1048576 ]] || return 1
-  "$BIN_PYTHON3" -c '
+  "$BIN_PYTHON3" -I -c '
 import configparser, sys
 section = sys.argv[1]
 blob = sys.stdin.read(1048577)
@@ -520,6 +527,7 @@ ExecStart=$HERE/$APP serve
 Restart=on-failure
 RestartSec=5s
 Environment=PATH=/usr/bin
+UnsetEnvironment=BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH
 NoNewPrivileges=yes
 UMask=0077
 LimitNOFILE=65536
@@ -545,7 +553,7 @@ rewrite_bookmarks() {
   dir=${BOOKMARKS%/*}
   ensure_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
   exec {bmfd}<"$dir" || fail "cannot pin bookmarks directory"
-  "$BIN_PYTHON3" - "$bmfd" "$dav_uri" "$old_uri" "$append" <<'PY' || rc=$?
+  "$BIN_PYTHON3" -I - "$bmfd" "$dav_uri" "$old_uri" "$append" <<'PY' || rc=$?
 import os, stat, sys
 dirfd, dav_uri, old_uri, append = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 existing = b""
@@ -595,6 +603,23 @@ ensure_bookmark() {
   rewrite_bookmarks "$dav_uri $display_name"
 }
 
+ensure_webdav_auth() {
+  ensure_dirs
+  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
+  [[ -f $WEBDAV_AUTH_HELPER && ! -L $WEBDAV_AUTH_HELPER ]] || fail "local WebDAV auth helper missing"
+  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
+  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" ensure "$authfd" "$WEBDAV_USER"
+  exec {authfd}<&-
+}
+
+service_main_pid() {
+  local pid
+  [[ -n $BIN_SYSTEMCTL ]] || return 1
+  pid=$("$BIN_SYSTEMCTL" --user show -p MainPID --value "$UNIT") || return 1
+  [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || return 1
+  printf '%s\n' "$pid"
+}
+
 service_running() {
   [[ -n $BIN_SYSTEMCTL ]] || return 1
   "$BIN_SYSTEMCTL" --user is-active --quiet "$UNIT"
@@ -612,11 +637,25 @@ label_mount() {
   "$BIN_GIO" set -t string "$dav_uri" metadata::display-name "$display_name" >/dev/null 2>&1 || true
 }
 
-mount_dav() {
+unmount_legacy_dav() {
   load_config
   [[ -n $BIN_GIO ]] || return 0
+  "$BIN_GIO" mount -u "$legacy_uri" >/dev/null 2>&1 || true
+  "$BIN_GIO" mount -u "$old_auth_uri" >/dev/null 2>&1 || true
   "$BIN_GIO" mount -u "$old_uri" >/dev/null 2>&1 || true
-  "$BIN_GIO" mount "$dav_uri" >/dev/null 2>&1 || true
+}
+
+mount_dav() {
+  load_config
+  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
+  local pid rclone_bin
+  pid=$(service_main_pid) || fail "service MainPID unavailable"
+  rclone_bin=$(find_rclone)
+  [[ -n $rclone_bin ]] || fail "rclone not found"
+  unmount_legacy_dav
+  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
+  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" mount "$authfd" "$WEBDAV_USER" "$dav_uri" "$pid" "$port" "$rclone_bin"
+  exec {authfd}<&-
   label_mount
 }
 
@@ -624,7 +663,7 @@ unmount_dav() {
   load_config
   [[ -n $BIN_GIO ]] || return 0
   "$BIN_GIO" mount -u "$dav_uri" >/dev/null 2>&1 || true
-  "$BIN_GIO" mount -u "$old_uri" >/dev/null 2>&1 || true
+  unmount_legacy_dav
 }
 
 cache_bytes() {
@@ -642,7 +681,7 @@ install_nautilus_extension() {
   [[ -f $src ]] || return 0
   ensure_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
   exec {extfd}<"$dir" || fail "cannot pin extension directory"
-  "$BIN_PYTHON3" - "$src" "$extfd" <<'PY' || rc=$?
+  "$BIN_PYTHON3" -I - "$src" "$extfd" <<'PY' || rc=$?
 import os, stat, sys
 src, dirfd = sys.argv[1], int(sys.argv[2])
 sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
@@ -714,6 +753,7 @@ cmd_ensure() {
   require_packages
   load_config
   save_config
+  ensure_webdav_auth
   write_unit
   ensure_bookmark
   install_nautilus_extension
@@ -726,6 +766,8 @@ cmd_serve() {
   [[ -n $rclone_bin ]] || fail "rclone not found"
   remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured"
   ensure_dir "$CACHE_DIR" || fail "refusing to use unsafe cache directory: $CACHE_DIR"
+  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
+  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" validate "$authfd" "$WEBDAV_USER"
   local args=(
     serve webdav "$remote"
     --addr "$bind"
@@ -737,21 +779,21 @@ cmd_serve() {
     --poll-interval 0
     --dir-cache-time 30s
     --cache-dir "$CACHE_DIR"
+    --htpasswd "/proc/self/fd/${authfd}/webdav.htpasswd"
   )
   exec "$rclone_bin" "${args[@]}"
 }
 
 wait_for_server() {
   load_config
-  local i
-  [[ -n $BIN_CURL ]] || fail "curl not found"
-  for i in {1..40}; do
-    if "$BIN_CURL" -sf --max-time 0.4 -o /dev/null -X OPTIONS "http://${bind}/" 2>/dev/null; then
-      return 0
-    fi
-    $SLEEP 0.15
-  done
-  return 1
+  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
+  local pid rclone_bin
+  pid=$(service_main_pid) || fail "service MainPID unavailable"
+  rclone_bin=$(find_rclone)
+  [[ -n $rclone_bin ]] || fail "rclone not found"
+  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
+  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" wait "$authfd" "$WEBDAV_USER" "$pid" "$port" "$rclone_bin"
+  exec {authfd}<&-
 }
 
 cmd_start() {
@@ -962,7 +1004,7 @@ remove_nautilus_extension() {
   dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
   ensure_dir "$dir" 2>/dev/null || return 0
   exec {extfd}<"$dir" 2>/dev/null || return 0
-  "$BIN_PYTHON3" - "$extfd" <<'PY' || rc=$?
+  "$BIN_PYTHON3" -I - "$extfd" <<'PY' || rc=$?
 import os, sys
 dirfd = int(sys.argv[1])
 try:

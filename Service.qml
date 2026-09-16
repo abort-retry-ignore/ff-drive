@@ -64,7 +64,7 @@ Item {
   property int _controlPgid: 0
 
   function wrappedCommand(args) {
-    return [setsidPath, bashPath, "-c", capScript, "ff", helperPath].concat(args)
+    return [setsidPath, bashPath, "-p", "-c", capScript, "ff", helperPath].concat(args)
   }
 
   function killGroup(pgid) {
