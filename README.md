@@ -38,14 +38,10 @@ downloads or executes remote installers.
 
 ## Local WebDAV authentication
 
-The localhost WebDAV server requires a random per-install credential. Its
-plaintext password and htpasswd hash are stored in
-`~/.config/fast-fruit-drive/` with mode 600. The password is supplied to GVFS
-in memory: it is never placed in the DAV URI, GTK bookmark, process arguments,
-or journal, and it is unrelated to your Apple password.
-
-Before supplying the credential, the helper verifies that both loopback
-listeners belong to the systemd unit's current rclone MainPID.
+The localhost WebDAV server requires a random per-install credential;
+unauthenticated requests get HTTP 401. See [SECURITY.md](SECURITY.md) for
+how the credential is generated, stored, and verified before GVFS ever
+sees it. It is unrelated to your Apple password.
 
 ## Sign-in and token expiry
 
@@ -107,11 +103,15 @@ fast-fruit-drive stop
 fast-fruit-drive toggle
 fast-fruit-drive open
 fast-fruit-drive uninstall
-fast-fruit-drive configure cache_max_size=4G cache_max_age=24h
+fast-fruit-drive configure cache_max_size=4G cache_max_age_hours=24
 ```
 
-Config lives in `~/.config/fast-fruit-drive/config`. Cache lives in
-`~/.cache/fast-fruit-drive`. The user systemd unit is `fast-fruit-drive.service`.
+Config lives in `~/.config/fast-fruit-drive/config` and only ever contains
+`cache_max_size` and `cache_max_age_hours` — the only two settings this
+plugin exposes. Everything else (remote name, bind address, port, DAV
+host, display name, VFS mode) is a fixed constant, not something a config
+file can steer. Cache lives in `~/.cache/fast-fruit-drive`. The user
+systemd unit is `fast-fruit-drive.service`.
 
 Starting the drive (explicit toggle or `start`) writes only:
 
@@ -123,25 +123,36 @@ Starting the drive (explicit toggle or `start`) writes only:
 
 ## Safety
 
-- No rclone purge/delete flags
-- Cache eviction is local only
-- Binds to `127.0.0.1` / `::1` only (enforced by validation)
-- Local WebDAV requires a random credential; unauthenticated requests receive 401
-- Listener ownership is verified against the rclone systemd MainPID before
-  GVFS receives the password
-- No sudo or pkexec
-- Does not overwrite `rclone.conf`
-- rclone, python3, systemctl, gio, nautilus, jq and coreutils are resolved as
-  verified absolute executables; the service PATH is `/usr/bin`
-- Directories are created component-wise with no-follow ancestor checks;
-  config, unit, and bookmark writes are atomic and replace only validated,
-  symlink-free paths; cache deletion refuses symlinked paths
-- Widget output is size-capped and kills the helper on overflow; every
-  helper call runs under a deadline that SIGTERMs the process group
+See [SECURITY.md](SECURITY.md) for the full trust model, including local
+WebDAV authentication and the pending-upload guard on `clear-cache` and
+`uninstall`. Summary:
+
+- **Read/write.** Nautilus operations on the iCloud Drive bookmark apply to
+  your real iCloud Drive, the same as any other Nautilus location.
+- Binds to `127.0.0.1` / `::1` only; the local WebDAV server requires a
+  random per-install credential, verified against the systemd `MainPID`
+  before GVFS ever receives it. Unauthenticated requests get HTTP 401.
+- `clear-cache` and `uninstall` refuse to run while any file has not
+  finished uploading, and restart the service so the upload can continue.
+- No rclone purge/delete flags; cache eviction is local only; does not
+  overwrite `rclone.conf`; no sudo or pkexec.
+- One isolated Python process (`python3 -I`) does all the work; there is
+  no shell anywhere in the plugin. Every filesystem operation is
+  descriptor-relative (`O_NOFOLLOW`, validate-and-use in the same call, no
+  path re-resolved later). Tools are resolved as verified, root-owned
+  absolute executables under a closed `PATH=/usr/bin`.
+- Every widget-triggered command runs through a small supervisor that caps
+  raw output at 64 KiB per stream before any line parsing, enforces a
+  wall-clock deadline, and group-kills and reaps the whole process tree on
+  timeout or overflow.
+- The systemd unit is sandboxed: `ProtectSystem=strict`,
+  `ProtectHome=read-only`, `NoNewPrivileges`, a stripped environment, an
+  empty capability set, and more — see SECURITY.md for the full list.
 
 ## Development
 
 ```sh
 omarchy plugin validate .
 qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Panel.qml Service.qml FruitIcon.qml
+python3 -m unittest discover -s tests -v
 ```
