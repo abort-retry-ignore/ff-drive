@@ -1,69 +1,1573 @@
-#!/usr/bin/bash -p
-# Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
-set -euo pipefail
+#!/usr/bin/python3 -I
+"""Fast Fruit Drive — rclone iCloud WebDAV helper for the Omarchy widget.
 
-# Privileged Bash mode ignores BASH_ENV and imported shell functions. Remove
-# interpreter/loader injection variables before spawning any child process.
-unset BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT
-unset LD_PRELOAD LD_LIBRARY_PATH
+One isolated (`-I`) Python process replaces the previous Bash-plus-embedded
+-Python helper. `-I` makes the interpreter ignore every PYTHON* environment
+variable and the user site directory, closing the injection path a hostile
+PYTHONPATH/PYTHONSTARTUP relied on. There is no shell anywhere in this file:
+no BASH_ENV, no quoting, no process substitution.
 
-# Closed environment: user-writable PATH entries are never consulted.
-# Named tools are still resolved as verified absolute executables below.
-PATH=/usr/bin
-export PATH
+State (config, systemd unit, GTK bookmark, Nautilus extension copy, WebDAV
+credentials, cache) is only ever touched through directory file descriptors
+opened component-by-component with O_NOFOLLOW (see `SafeDir`). A path is
+validated and used in the same open call; nothing is checked, discarded, and
+reopened by name later, so a symlink swap between "check" and "use" cannot
+redirect an operation.
 
-# If the widget watchdog SIGTERMs us, take the whole process group
-# (curl/gio children). Nautilus is spawned with setsid so it survives.
-trap 'trap - TERM INT; kill -- -$$ 2>/dev/null || true' TERM INT
+The only configurable settings are cache size and cache max age (matching
+manifest.json exactly). Remote name, bind address, port, DAV host, display
+name and VFS mode are fixed constants: there was never a UI for them, and a
+fixed value cannot be pointed at something else.
 
-readonly USER_UID=$EUID
-readonly STAT=/usr/bin/stat
-readonly MKDIR=/usr/bin/mkdir
-readonly REALPATH=/usr/bin/realpath
-readonly CAT=/usr/bin/cat
-readonly SLEEP=/usr/bin/sleep
-readonly READLINK=/usr/bin/readlink
-readonly GREP=/usr/bin/grep
-readonly AWK=/usr/bin/awk
-readonly DU=/usr/bin/du
-readonly NUMFMT=/usr/bin/numfmt
+Every subprocess this script spawns — rclone, gio, systemctl, nautilus,
+omarchy, xdg-terminal-exec, and recursive calls to itself — is launched with
+an explicit allow-listed environment (`sanitized_child_env`) and, where the
+call is untrusted or unbounded, through `run_bounded`, which enforces a
+monotonic deadline and a raw-byte ceiling on stdout/stderr *before* any
+line-oriented parsing happens, then terminates and reaps the whole process
+group. The `__supervise` command applies the same primitive to whole helper
+invocations so the QML widget never has to.
+"""
 
-APP=fast-fruit-drive
-UNIT=fast-fruit-drive.service
-_src=${BASH_SOURCE[0]}
-_dir=${_src%/*}
-[[ $_dir == "$_src" ]] && _dir=.
-HERE=$(cd "$_dir" && pwd)
-PLUGIN_DIR=$(cd "$HERE/.." && pwd)
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
-CONFIG_FILE="$CONFIG_DIR/config"
-UNIT_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
-BOOKMARKS="${XDG_CONFIG_HOME:-$HOME/.config}/gtk-3.0/bookmarks"
-RCLONE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/rclone/rclone.conf"
-WEBDAV_AUTH_HELPER="$HERE/fast-fruit-drive-auth.py"
-readonly WEBDAV_USER=ff-drive
+from __future__ import annotations
 
-DEFAULT_REMOTE="icloud:"
-DEFAULT_BIND="127.0.0.1:8080"
-DEFAULT_DAV_HOST="iCloud.localhost"
-DEFAULT_CACHE_MAX_SIZE="4G"
-DEFAULT_CACHE_MAX_AGE="24h"
-DEFAULT_DISPLAY_NAME="iCloud Drive"
-DEFAULT_VFS_CACHE_MODE="full"
+import base64
+import hashlib
+import http.client
+import json
+import os
+import pwd
+import re
+import secrets
+import select
+import signal
+import stat
+import subprocess
+import sys
+import time
 
-BIN_PYTHON3=
-BIN_SYSTEMCTL=
-BIN_GIO=
-BIN_JQ=
-BIN_NAUTILUS=
-BIN_SETSID=
-BIN_OMARCHY=
-BIN_XDG_TERMINAL=
+APP = "fast-fruit-drive"
+UNIT_NAME = "fast-fruit-drive.service"
 
-usage() {
-  $CAT <<EOF
-Usage: $APP <command> [args]
+# ---------------------------------------------------------------------
+# Fixed identity. None of this is configurable: there is no UI for it, and
+# a constant cannot be redirected by a hostile config file.
+# ---------------------------------------------------------------------
+REMOTE = "icloud:"
+REMOTE_NAME = "icloud"
+BIND_V4 = "127.0.0.1"
+BIND_V6 = "::1"
+PORT = 8080
+DAV_HOST = "iCloud.localhost"
+DISPLAY_NAME = "iCloud Drive"
+VFS_CACHE_MODE = "full"
+WEBDAV_USER = "ff-drive"
+
+DAV_URI = f"dav://{WEBDAV_USER}@{DAV_HOST}:{PORT}/"
+LEGACY_URI_NO_USER = f"dav://{DAV_HOST}:{PORT}/"
+LEGACY_URI_OLD_HOST_AUTH = f"dav://{WEBDAV_USER}@{BIND_V4}:{PORT}/"
+LEGACY_URI_OLD_HOST = f"dav://{BIND_V4}:{PORT}/"
+
+CACHE_SIZE_CHOICES = ("512M", "1G", "2G", "4G", "8G", "16G")
+DEFAULT_CACHE_MAX_SIZE = "4G"
+DEFAULT_CACHE_MAX_AGE_HOURS = 24
+MIN_CACHE_MAX_AGE_HOURS = 1
+MAX_CACHE_MAX_AGE_HOURS = 168
+
+OUTPUT_CAP = 65536
+STATUS_TIMEOUT = 12.0
+CONTROL_TIMEOUT = 40.0
+SUPERVISE_GRACE = 3.0
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SELF_PATH = os.path.join(HERE, os.path.basename(__file__))
+PLUGIN_DIR = os.path.dirname(HERE)
+NAUTILUS_SOURCE = os.path.join(PLUGIN_DIR, "nautilus", "fast_fruit_drive_nautilus.py")
+
+PUBLIC_COMMANDS = (
+    "status", "start", "stop", "restart", "toggle", "open",
+    "login", "login-tui", "serve", "ensure", "configure",
+    "clear-cache", "uninstall", "help",
+)
+# serve (systemd's long-running ExecStart) and login-tui (an interactive
+# terminal session) must never be time-boxed or byte-capped by __supervise.
+SUPERVISABLE_COMMANDS = frozenset(PUBLIC_COMMANDS) - {"serve", "login-tui", "help"}
+
+
+def fail(message: str) -> "None":
+    print(f"{APP}: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def bool_value(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def home_dir() -> str:
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+HOME = home_dir()
+CONFIG_DIR = os.path.join(HOME, ".config", APP)
+CACHE_DIR = os.path.join(HOME, ".cache", APP)
+UNIT_DIR = os.path.join(HOME, ".config", "systemd", "user")
+WANTS_DIR = os.path.join(UNIT_DIR, "default.target.wants")
+BOOKMARKS_DIR = os.path.join(HOME, ".config", "gtk-3.0")
+RCLONE_CONF_DIR = os.path.join(HOME, ".config", "rclone")
+EXTENSION_DIR = os.path.join(HOME, ".local", "share", "nautilus-python", "extensions")
+
+
+# =======================================================================
+# Descriptor-relative state handling
+#
+# Every path component is opened with O_NOFOLLOW relative to an already
+# -open, already-validated parent directory descriptor. Validation and use
+# happen in the same os.open() call, so there is no window between
+# "check" and "use" for a symlink swap to exploit. Writes are atomic
+# (O_EXCL temp file + rename, both relative to the same retained fd).
+# =======================================================================
+
+class Unsafe(RuntimeError):
+    """A path, owner, or permission did not match what we require."""
+
+
+def _overflow_uid() -> int:
+    try:
+        with open("/proc/sys/kernel/overflowuid", encoding="ascii") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 65534
+
+
+# Only ever set for the sandboxed 'serve' entry point (see cmd_serve/main).
+# systemd applies an unprivileged user namespace to satisfy ProtectSystem=
+# strict/ProtectHome=read-only for --user units: our own uid maps through
+# unchanged, but every other uid (including root) is remapped to the
+# kernel's overflow uid, because it has no mapping inside that namespace.
+# The sandbox itself (read-only /usr and /home, closed PATH, no shell,
+# NoNewPrivileges) already provides the guarantee the ownership check
+# exists for, so 'serve' additionally trusts the overflow uid as standing
+# in for root. No other command runs under this sandbox, so no other
+# command relaxes this check.
+_EXTRA_TRUSTED_UIDS: frozenset = frozenset()
+
+
+def _trusted_uids() -> frozenset:
+    return frozenset({0, os.getuid()}) | _EXTRA_TRUSTED_UIDS
+
+
+def _valid_component(name: str) -> bool:
+    if not name or name in (".", ".."):
+        return False
+    if "/" in name or "\0" in name:
+        return False
+    return all(ord(ch) >= 32 for ch in name)
+
+
+class SafeDir:
+    """A directory whose identity is pinned by an open, no-follow fd."""
+
+    __slots__ = ("fd",)
+
+    def __init__(self, fd: int):
+        self.fd = fd
+
+    def close(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __enter__(self) -> "SafeDir":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    @classmethod
+    def open_root(cls) -> "SafeDir":
+        return cls(os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+
+    def _check_owner_mode(self, st: os.stat_result, allowed_uids) -> None:
+        if st.st_uid not in allowed_uids:
+            raise Unsafe("unexpected owner")
+        if st.st_mode & 0o022:
+            raise Unsafe("group- or world-writable")
+
+    def enter(self, name: str, *, create: bool = False, mode: int = 0o700,
+              allowed_uids=None) -> "SafeDir":
+        if allowed_uids is None:
+            allowed_uids = _trusted_uids()
+        if not _valid_component(name):
+            raise Unsafe(f"unsafe path component: {name!r}")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            fd = os.open(name, flags, dir_fd=self.fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(name, mode, dir_fd=self.fd)
+            fd = os.open(name, flags, dir_fd=self.fd)
+        except NotADirectoryError as exc:
+            raise Unsafe(f"{name} exists and is not a directory") from exc
+        try:
+            self._check_owner_mode(os.fstat(fd), allowed_uids)
+        except Unsafe:
+            os.close(fd)
+            raise
+        return SafeDir(fd)
+
+    def walk(self, path: str, *, create: bool = False,
+              allowed_uids=None) -> "SafeDir":
+        if allowed_uids is None:
+            allowed_uids = _trusted_uids()
+        cur: SafeDir = self
+        opened: list[SafeDir] = []
+        try:
+            for part in [p for p in path.strip("/").split("/") if p]:
+                nxt = cur.enter(part, create=create, allowed_uids=allowed_uids)
+                opened.append(nxt)
+                cur = nxt
+        except BaseException:
+            for d in opened:
+                d.close()
+            raise
+        for d in opened[:-1]:
+            d.close()
+        return opened[-1] if opened else SafeDir(os.dup(self.fd))
+
+    def atomic_write(self, name: str, data: bytes, mode: int = 0o600) -> None:
+        if not _valid_component(name):
+            raise Unsafe(f"unsafe filename: {name!r}")
+        tmp = ".ff-" + secrets.token_hex(10)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     mode, dir_fd=self.fd)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.rename(tmp, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=self.fd)
+            except OSError:
+                pass
+            raise
+        try:
+            os.fsync(self.fd)
+        except OSError:
+            pass
+
+    def read_bounded(self, name: str, max_bytes: int, *, missing_ok: bool = False,
+                      allowed_uids=None) -> "bytes | None":
+        if allowed_uids is None:
+            allowed_uids = _trusted_uids()
+        if not _valid_component(name):
+            raise Unsafe(f"unsafe filename: {name!r}")
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise Unsafe(f"{name} is not a regular file")
+            self._check_owner_mode(st, allowed_uids)
+            if st.st_size > max_bytes:
+                raise Unsafe(f"{name} is too large")
+            data = bytearray()
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    raise Unsafe(f"{name} is too large")
+            return bytes(data)
+        finally:
+            os.close(fd)
+
+    def unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            pass
+
+    def remove_tree(self, name: str, *, max_entries: int = 200_000, max_depth: int = 64) -> None:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=self.fd)
+        except FileNotFoundError:
+            return
+        except NotADirectoryError:
+            os.unlink(name, dir_fd=self.fd)
+            return
+        counter = [0]
+
+        def wipe(dfd: int, depth: int) -> None:
+            if depth > max_depth:
+                raise Unsafe("tree too deep")
+            with os.scandir(dfd) as it:
+                entries = list(it)
+            for entry in entries:
+                counter[0] += 1
+                if counter[0] > max_entries:
+                    raise Unsafe("tree too large")
+                if entry.is_dir(follow_symlinks=False):
+                    child = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dfd)
+                    try:
+                        wipe(child, depth + 1)
+                    finally:
+                        os.close(child)
+                    os.rmdir(entry.name, dir_fd=dfd)
+                else:
+                    os.unlink(entry.name, dir_fd=dfd)
+
+        try:
+            wipe(fd, 0)
+        finally:
+            os.close(fd)
+        os.rmdir(name, dir_fd=self.fd)
+
+    def scandir_names(self):
+        with os.scandir(self.fd) as it:
+            yield from list(it)
+
+
+def open_home() -> SafeDir:
+    if not HOME.startswith("/"):
+        raise Unsafe("unexpected home directory")
+    root = SafeDir.open_root()
+    try:
+        return root.walk(HOME)
+    finally:
+        root.close()
+
+
+def ensure_state_dir(rel_path: str) -> SafeDir:
+    """Open (creating component-wise as needed) a directory under HOME."""
+    with open_home() as home:
+        return home.walk(rel_path, create=True)
+
+
+def open_state_dir(rel_path: str) -> "SafeDir | None":
+    try:
+        with open_home() as home:
+            return home.walk(rel_path)
+    except (FileNotFoundError, Unsafe):
+        return None
+
+
+def rel_to_home(path: str) -> str:
+    return os.path.relpath(path, HOME)
+
+
+# =======================================================================
+# Verified tool resolution — closed PATH, root-owned regular executables
+# only, symlinks followed at most three hops and only within /usr.
+# =======================================================================
+
+_TRUSTED_BASES = ("/usr/bin/", "/usr/local/bin/")
+_TRUSTED_LINK_TARGETS = ("/usr/bin/", "/usr/local/bin/", "/usr/lib/", "/usr/share/")
+
+
+def _root_owned_ancestors(dirpath: str) -> bool:
+    try:
+        root = SafeDir.open_root()
+    except OSError:
+        return False
+    try:
+        root.walk(dirpath, allowed_uids=frozenset({0}) | _EXTRA_TRUSTED_UIDS).close()
+        return True
+    except (Unsafe, OSError):
+        return False
+    finally:
+        root.close()
+
+
+def _leaf_is_safe_exec(path: str) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_uid not in (frozenset({0}) | _EXTRA_TRUSTED_UIDS) or st.st_mode & 0o022 or not st.st_mode & 0o111:
+        return False
+    return True
+
+
+def verified_exec(path: str) -> "str | None":
+    hops = 0
+    while True:
+        if not path.startswith(_TRUSTED_BASES):
+            return None
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > 3 or st.st_uid not in (frozenset({0}) | _EXTRA_TRUSTED_UIDS):
+                return None
+            if not _root_owned_ancestors(os.path.dirname(path)):
+                return None
+            try:
+                target = os.readlink(path)
+            except OSError:
+                return None
+            if not target or ".." in target.split("/"):
+                return None
+            if not target.startswith("/"):
+                target = os.path.normpath(os.path.join(os.path.dirname(path), target))
+            else:
+                target = os.path.normpath(target)
+            if not target.startswith(_TRUSTED_LINK_TARGETS):
+                return None
+            path = target
+            continue
+        if not _leaf_is_safe_exec(path):
+            return None
+        if not _root_owned_ancestors(os.path.dirname(path)):
+            return None
+        return path
+
+
+def find_verified(name: str) -> "str | None":
+    for base in ("/usr/bin", "/usr/local/bin"):
+        resolved = verified_exec(f"{base}/{name}")
+        if resolved:
+            return resolved
+    return None
+
+
+class Tools:
+    python3 = ""
+    systemctl = ""
+    gio = ""
+    nautilus = ""
+    omarchy = ""
+    xdg_terminal = ""
+    rclone = ""
+
+
+def resolve_tools() -> None:
+    Tools.python3 = find_verified("python3") or ""
+    Tools.systemctl = find_verified("systemctl") or ""
+    Tools.gio = find_verified("gio") or ""
+    Tools.nautilus = find_verified("nautilus") or ""
+    Tools.omarchy = find_verified("omarchy") or ""
+    Tools.xdg_terminal = find_verified("xdg-terminal-exec") or ""
+    Tools.rclone = find_verified("rclone") or ""
+
+
+# =======================================================================
+# Bounded process execution
+#
+# Every subprocess is spawned with an explicit allow-listed environment, in
+# its own session (so it can be group-killed without touching our caller),
+# and — for run_bounded callers — with raw stdout/stderr capped in bytes
+# *before* any line parsing, plus a monotonic deadline. On timeout or
+# overflow the whole process group is TERM'd, then KILL'd, and reaped.
+# =======================================================================
+
+_ENV_KEEP_EXACT = frozenset({
+    "HOME", "USER", "LOGNAME", "LANG", "TZ",
+    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+    "DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "DISPLAY",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+})
+
+
+def sanitized_child_env(extra: "dict | None" = None) -> dict:
+    env = {"PATH": "/usr/bin"}
+    for key, value in os.environ.items():
+        if key in _ENV_KEEP_EXACT or key.startswith("LC_"):
+            env[key] = value
+    if extra:
+        env.update(extra)
+    return env
+
+
+class BoundedResult:
+    def __init__(self, returncode: int, stdout: bytes, stderr: bytes, *,
+                 timed_out: bool = False, overflowed: bool = False):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.overflowed = overflowed
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0 and not self.timed_out and not self.overflowed
+
+
+def _killpg(proc: subprocess.Popen, *, force: bool) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL if force else signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def run_bounded(argv, *, timeout: float, cap: int = OUTPUT_CAP,
+                input_bytes: "bytes | None" = None, env: "dict | None" = None) -> BoundedResult:
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env if env is not None else sanitized_child_env(),
+        start_new_session=True,
+        close_fds=True,
+    )
+    out = bytearray()
+    err = bytearray()
+    overflowed = False
+    timed_out = False
+    pipes = {proc.stdout.fileno(): ("out", proc.stdout), proc.stderr.fileno(): ("err", proc.stderr)}
+    for fh in (proc.stdout, proc.stderr):
+        os.set_blocking(fh.fileno(), False)
+    if input_bytes is not None:
+        try:
+            proc.stdin.write(input_bytes)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    deadline = time.monotonic() + timeout
+    open_fds = set(pipes)
+    try:
+        while open_fds:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select(list(open_fds), [], [], min(remaining, 0.25))
+            for fd in ready:
+                which, _fh = pipes[fd]
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    open_fds.discard(fd)
+                    continue
+                target = out if which == "out" else err
+                if len(target) < cap:
+                    target.extend(chunk[: cap - len(target)])
+                if len(target) >= cap:
+                    overflowed = True
+            if overflowed:
+                break
+        if timed_out or overflowed:
+            _killpg(proc, force=False)
+    finally:
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            _killpg(proc, force=True)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        for fh in (proc.stdout, proc.stderr):
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    return BoundedResult(proc.returncode or 0, bytes(out), bytes(err),
+                         timed_out=timed_out, overflowed=overflowed)
+
+
+def spawn_detached(argv, env: "dict | None" = None) -> None:
+    """Fire-and-forget a process (terminal, file manager) in its own
+    session so it outlives and is never reaped or signalled by us."""
+    subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env if env is not None else sanitized_child_env(),
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+# =======================================================================
+# Config — cache size and cache max age only. Everything else is fixed.
+# =======================================================================
+
+def valid_cache_size(value: str) -> bool:
+    return value in CACHE_SIZE_CHOICES
+
+
+def valid_cache_age_hours(value: str) -> bool:
+    if not re.fullmatch(r"[0-9]{1,4}", value):
+        return False
+    return MIN_CACHE_MAX_AGE_HOURS <= int(value) <= MAX_CACHE_MAX_AGE_HOURS
+
+
+class Config:
+    cache_max_size = DEFAULT_CACHE_MAX_SIZE
+    cache_max_age_hours = DEFAULT_CACHE_MAX_AGE_HOURS
+
+    @property
+    def cache_max_age(self) -> str:
+        return f"{self.cache_max_age_hours}h"
+
+
+def load_config() -> Config:
+    cfg = Config()
+    cfg.cache_max_size = DEFAULT_CACHE_MAX_SIZE
+    cfg.cache_max_age_hours = DEFAULT_CACHE_MAX_AGE_HOURS
+    d = open_state_dir(rel_to_home(CONFIG_DIR))
+    if d is None:
+        return cfg
+    try:
+        try:
+            data = d.read_bounded("config", 65536, missing_ok=True)
+        except Unsafe as exc:
+            print(f"{APP}: {exc}, using defaults", file=sys.stderr)
+            return cfg
+        if data is None:
+            return cfg
+        legacy_age = None
+        for line in data.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key == "cache_max_size":
+                if valid_cache_size(value):
+                    cfg.cache_max_size = value
+                else:
+                    print(f"{APP}: invalid cache_max_size '{value}' in config, using default", file=sys.stderr)
+            elif key == "cache_max_age_hours":
+                if valid_cache_age_hours(value):
+                    cfg.cache_max_age_hours = int(value)
+                else:
+                    print(f"{APP}: invalid cache_max_age_hours '{value}' in config, using default", file=sys.stderr)
+            elif key == "cache_max_age":
+                # Pre-0.2 configs stored a duration string; migrate hours only.
+                m = re.fullmatch(r"([0-9]{1,4})h", value)
+                if m and valid_cache_age_hours(m.group(1)):
+                    legacy_age = int(m.group(1))
+            # Any other legacy key (remote/bind/dav_host/display_name/
+            # vfs_cache_mode/addr) is intentionally dropped: those are now
+            # fixed constants, not configurable, and self-heal on next save.
+        if legacy_age is not None and cfg.cache_max_age_hours == DEFAULT_CACHE_MAX_AGE_HOURS:
+            cfg.cache_max_age_hours = legacy_age
+        return cfg
+    finally:
+        d.close()
+
+
+def save_config(cfg: Config) -> None:
+    d = ensure_state_dir(rel_to_home(CONFIG_DIR))
+    try:
+        body = (
+            f"cache_max_size={cfg.cache_max_size}\n"
+            f"cache_max_age_hours={cfg.cache_max_age_hours}\n"
+        )
+        d.atomic_write("config", body.encode("ascii"), 0o600)
+    finally:
+        d.close()
+
+
+# =======================================================================
+# rclone remote / session checks
+# =======================================================================
+
+def remote_configured() -> bool:
+    if not Tools.rclone:
+        return False
+    result = run_bounded([Tools.rclone, "listremotes"], timeout=5, env=sanitized_child_env())
+    if not result.ok:
+        return False
+    names = {line.strip().rstrip(":") for line in result.stdout.decode("utf-8", "replace").splitlines()}
+    return REMOTE_NAME in names
+
+
+def session_present() -> bool:
+    import configparser
+
+    d = open_state_dir(rel_to_home(RCLONE_CONF_DIR))
+    if d is None:
+        return False
+    try:
+        try:
+            data = d.read_bounded("rclone.conf", 1_048_576, missing_ok=True)
+        except Unsafe:
+            return False
+        if data is None:
+            return False
+        parser = configparser.ConfigParser()
+        try:
+            parser.read_string(data.decode("utf-8", "replace"))
+        except configparser.Error:
+            return False
+        if not parser.has_section(REMOTE_NAME):
+            return False
+        token = parser.get(REMOTE_NAME, "trust_token", fallback="").strip()
+        cookies = parser.get(REMOTE_NAME, "cookies", fallback="").strip()
+        return bool(token or cookies)
+    finally:
+        d.close()
+
+
+# =======================================================================
+# WebDAV authentication
+#
+# A random per-install credential lives in CONFIG_DIR, owner-only. rclone
+# is handed only the htpasswd hash, via an inherited directory fd, never a
+# path that could be swapped later. GVFS gets the plaintext through
+# Gio.MountOperation, in memory: never the URI, argv, bookmark, or journal.
+# Before the password is ever supplied to GVFS, the listener is proven to
+# be owned by the current systemd MainPID running the verified rclone
+# binary with authenticated arguments.
+# =======================================================================
+
+WEBDAV_PASSWORD_FILE = "webdav-password"
+WEBDAV_HTPASSWD_FILE = "webdav.htpasswd"
+MAX_SECRET = 256
+PASSWORD_RE = re.compile(r"[A-Za-z0-9_-]{40,128}\Z")
+IPV4_LOOPBACK_HEX = "0100007F"
+IPV6_LOOPBACK_HEX = "00000000000000000000000001000000"
+
+
+class AuthError(RuntimeError):
+    pass
+
+
+def _expected_htpasswd(password: str) -> bytes:
+    digest = base64.b64encode(hashlib.sha1(password.encode()).digest()).decode()
+    return f"{WEBDAV_USER}:{{SHA}}{digest}\n".encode()
+
+
+def _password_from_dir(d: SafeDir, *, create: bool) -> str:
+    raw = d.read_bounded(WEBDAV_PASSWORD_FILE, MAX_SECRET, missing_ok=create,
+                          allowed_uids=frozenset({os.getuid()}))
+    if raw is None:
+        password = secrets.token_urlsafe(32)
+        d.atomic_write(WEBDAV_PASSWORD_FILE, (password + "\n").encode(), 0o600)
+        return password
+    try:
+        password = raw.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise AuthError("invalid local WebDAV password") from exc
+    if not PASSWORD_RE.fullmatch(password):
+        raise AuthError("invalid local WebDAV password")
+    return password
+
+
+def ensure_webdav_auth() -> None:
+    d = ensure_state_dir(rel_to_home(CONFIG_DIR))
+    try:
+        password = _password_from_dir(d, create=True)
+        d.atomic_write(WEBDAV_HTPASSWD_FILE, _expected_htpasswd(password), 0o600)
+    finally:
+        d.close()
+
+
+def validate_webdav_auth(d: SafeDir) -> str:
+    password = _password_from_dir(d, create=False)
+    actual = d.read_bounded(WEBDAV_HTPASSWD_FILE, MAX_SECRET,
+                             allowed_uids=frozenset({os.getuid()}))
+    if actual != _expected_htpasswd(password):
+        raise AuthError("local WebDAV credentials do not match")
+    return password
+
+
+def _socket_inodes(pid: int) -> set:
+    result = set()
+    try:
+        with os.scandir(f"/proc/{pid}/fd") as it:
+            for count, entry in enumerate(it):
+                if count >= 8192:
+                    raise AuthError("service has too many file descriptors")
+                try:
+                    target = os.readlink(entry.path)
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target.endswith("]"):
+                    result.add(target[8:-1])
+    except OSError as exc:
+        raise AuthError("cannot inspect service sockets") from exc
+    return result
+
+
+def _table_listener_inode(table: str, address: str, port: int) -> "str | None":
+    expected = f"{address}:{port:04X}"
+    try:
+        with open(table, encoding="ascii") as fh:
+            next(fh, None)
+            for line in fh:
+                fields = line.split()
+                if len(fields) > 9 and fields[1].upper() == expected and fields[3] == "0A":
+                    return fields[9]
+    except OSError:
+        return None
+    return None
+
+
+def listener_owned(pid: int, rclone_bin: str) -> None:
+    if pid <= 1:
+        raise AuthError("invalid service identity")
+    try:
+        exe = os.path.realpath(f"/proc/{pid}/exe")
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read(8192).split(b"\0")
+    except OSError as exc:
+        raise AuthError("service process disappeared") from exc
+    if exe != os.path.realpath(rclone_bin):
+        raise AuthError("listener is not the expected rclone process")
+    if b"serve" not in cmdline or b"webdav" not in cmdline or b"--htpasswd" not in cmdline:
+        raise AuthError("rclone service is missing authenticated WebDAV arguments")
+    index = cmdline.index(b"--htpasswd")
+    if index + 1 >= len(cmdline):
+        raise AuthError("rclone service has no htpasswd value")
+    htpasswd_arg = cmdline[index + 1]
+    if not htpasswd_arg.startswith(b"/proc/self/fd/") or not htpasswd_arg.endswith(b"/" + WEBDAV_HTPASSWD_FILE.encode()):
+        raise AuthError("rclone service has an unexpected htpasswd source")
+    expected = {
+        _table_listener_inode("/proc/net/tcp", IPV4_LOOPBACK_HEX, PORT),
+        _table_listener_inode("/proc/net/tcp6", IPV6_LOOPBACK_HEX, PORT),
+    }
+    if None in expected or not expected.issubset(_socket_inodes(pid)):
+        raise AuthError("WebDAV listeners are not owned by the service MainPID")
+
+
+def authenticated_options(password: str) -> bool:
+    token = base64.b64encode(f"{WEBDAV_USER}:{password}".encode()).decode()
+    conn = http.client.HTTPConnection(BIND_V4, PORT, timeout=0.4)
+    try:
+        conn.request("OPTIONS", "/", headers={"Authorization": f"Basic {token}"})
+        response = conn.getresponse()
+        response.read(1024)
+        return response.status == 200
+    except OSError:
+        return False
+    finally:
+        conn.close()
+
+
+def wait_webdav_ready(pid: int, rclone_bin: str) -> None:
+    d = open_state_dir(rel_to_home(CONFIG_DIR))
+    if d is None:
+        fail("config directory missing")
+    try:
+        password = validate_webdav_auth(d)
+    except AuthError as exc:
+        fail(str(exc))
+    finally:
+        d.close()
+    for _ in range(40):
+        try:
+            listener_owned(pid, rclone_bin)
+        except AuthError:
+            pass
+        else:
+            if authenticated_options(password):
+                return
+        time.sleep(0.15)
+    fail("authenticated WebDAV service did not become ready")
+
+
+def mount_dav(pid: int, rclone_bin: str) -> None:
+    d = open_state_dir(rel_to_home(CONFIG_DIR))
+    if d is None:
+        fail("config directory missing")
+    try:
+        password = validate_webdav_auth(d)
+    except AuthError as exc:
+        fail(str(exc))
+    finally:
+        d.close()
+    try:
+        listener_owned(pid, rclone_bin)
+    except AuthError as exc:
+        fail(str(exc))
+    if not authenticated_options(password):
+        fail("authenticated WebDAV readiness check failed")
+
+    from gi.repository import Gio, GLib  # noqa: E402  (import here: only mount needs GObject)
+
+    loop = GLib.MainLoop()
+    result = {"ok": False, "error": None}
+    operation = Gio.MountOperation()
+    cancellable = Gio.Cancellable()
+    operation.set_username(WEBDAV_USER)
+    operation.set_password(password)
+    operation.set_password_save(Gio.PasswordSave.NEVER)
+
+    def ask_password(op, *_a):
+        op.set_username(WEBDAV_USER)
+        op.set_password(password)
+        op.set_password_save(Gio.PasswordSave.NEVER)
+        op.reply(Gio.MountOperationResult.HANDLED)
+
+    def done(source, async_result):
+        try:
+            source.mount_enclosing_volume_finish(async_result)
+            result["ok"] = True
+        except GLib.Error as exc:
+            if exc.matches(Gio.io_error_quark(), Gio.IOErrorEnum.ALREADY_MOUNTED):
+                result["ok"] = True
+            else:
+                result["error"] = str(exc)
+        loop.quit()
+
+    def timeout():
+        cancellable.cancel()
+        loop.quit()
+        return False
+
+    operation.connect("ask-password", ask_password)
+    gfile = Gio.File.new_for_uri(DAV_URI)
+    gfile.mount_enclosing_volume(Gio.MountMountFlags.NONE, operation, cancellable, done)
+    GLib.timeout_add_seconds(10, timeout)
+    loop.run()
+    try:
+        listener_owned(pid, rclone_bin)
+    except AuthError as exc:
+        fail(str(exc))
+    if not result["ok"]:
+        fail(result["error"] or "timed out mounting authenticated WebDAV")
+
+
+# =======================================================================
+# systemd unit / GTK bookmark / Nautilus extension
+# =======================================================================
+
+def write_unit() -> None:
+    d = ensure_state_dir(rel_to_home(UNIT_DIR))
+    try:
+        unit = f"""\
+[Unit]
+Description=Fast Fruit Drive \u2014 rclone iCloud WebDAV for Nautilus
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart={SELF_PATH} serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=control-group
+Environment=PATH=/usr/bin
+UnsetEnvironment=BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GIO_EXTRA_MODULES GI_TYPELIB_PATH GSETTINGS_BACKEND GIO_USE_VFS
+NoNewPrivileges=yes
+UMask=0077
+LimitNOFILE=65536
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths={CACHE_DIR}
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier={APP}
+
+[Install]
+WantedBy=default.target
+"""
+        d.atomic_write(UNIT_NAME, unit.encode("utf-8"), 0o644)
+    finally:
+        d.close()
+    if not Tools.systemctl:
+        fail("systemctl not found")
+    run_bounded([Tools.systemctl, "--user", "daemon-reload"], timeout=10)
+    run_bounded([Tools.systemctl, "--user", "enable", UNIT_NAME], timeout=10)
+
+
+def rewrite_bookmarks(append: "str | None") -> None:
+    d = ensure_state_dir(rel_to_home(BOOKMARKS_DIR))
+    try:
+        existing = d.read_bounded("bookmarks", 1_048_576, missing_ok=True)
+        lines = existing.decode("utf-8", "replace").splitlines() if existing else []
+        drop_prefixes = (DAV_URI, LEGACY_URI_NO_USER, LEGACY_URI_OLD_HOST_AUTH, LEGACY_URI_OLD_HOST)
+        keep = [
+            line for line in lines
+            if not (line.startswith("dav://") and (
+                "iCloud Drive" in line or "iCloud WebDAV" in line
+                or line.startswith(drop_prefixes)))
+        ]
+        if append:
+            keep.append(append)
+        data = ("\n".join(keep) + "\n").encode("utf-8", "replace") if keep else b""
+        d.atomic_write("bookmarks", data, 0o600)
+    finally:
+        d.close()
+
+
+def ensure_bookmark() -> None:
+    rewrite_bookmarks(f"{DAV_URI} {DISPLAY_NAME}")
+
+
+def remove_bookmark() -> None:
+    rewrite_bookmarks(None)
+
+
+def install_nautilus_extension() -> None:
+    if not os.path.isfile(NAUTILUS_SOURCE):
+        return
+    try:
+        with open(NAUTILUS_SOURCE, "rb") as fh:
+            src_st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(src_st.st_mode) or src_st.st_size > 2_097_152:
+                fail("refusing to install oversized Nautilus extension source")
+            data = fh.read(2_097_153)
+            if len(data) > 2_097_152:
+                fail("refusing to install oversized Nautilus extension source")
+    except OSError as exc:
+        fail(f"cannot read Nautilus extension source: {exc}")
+
+    d = ensure_state_dir(rel_to_home(EXTENSION_DIR))
+    try:
+        existing = d.read_bounded("fast_fruit_drive_nautilus.py", 2_097_152, missing_ok=True)
+        if existing == data:
+            return
+        d.atomic_write("fast_fruit_drive_nautilus.py", data, 0o644)
+    finally:
+        d.close()
+
+
+def remove_nautilus_extension() -> None:
+    d = open_state_dir(rel_to_home(EXTENSION_DIR))
+    if d is None:
+        return
+    try:
+        d.unlink("fast_fruit_drive_nautilus.py")
+        try:
+            pycache = d.enter("__pycache__")
+        except (FileNotFoundError, Unsafe):
+            return
+        try:
+            for entry in list(pycache.scandir_names()):
+                if entry.name.startswith("fast_fruit_drive_nautilus"):
+                    pycache.unlink(entry.name)
+        finally:
+            pycache.close()
+    finally:
+        d.close()
+
+
+# =======================================================================
+# Pending-upload protection
+#
+# clear-cache and uninstall both delete the local VFS cache. rclone tracks
+# not-yet-uploaded writes in vfsMeta/<remote>/... with "Dirty": true; that
+# state must never be deleted before the upload finishes. The scan below
+# is descriptor-relative and bounded (depth, entry count, per-file size),
+# exactly like every other tree walk in this file.
+# =======================================================================
+
+MAX_META_ENTRIES = 200_000
+MAX_META_DEPTH = 64
+MAX_META_FILE = 262_144
+
+
+def _scan_dirty(d: SafeDir, depth: int, counter: list) -> bool:
+    if depth > MAX_META_DEPTH:
+        raise Unsafe("cache metadata tree too deep")
+    for entry in d.scandir_names():
+        counter[0] += 1
+        if counter[0] > MAX_META_ENTRIES:
+            raise Unsafe("cache metadata tree too large")
+        if entry.is_dir(follow_symlinks=False):
+            child = d.enter(entry.name)
+            try:
+                if _scan_dirty(child, depth + 1, counter):
+                    return True
+            finally:
+                child.close()
+            continue
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            data = d.read_bounded(entry.name, MAX_META_FILE, missing_ok=True)
+        except Unsafe:
+            continue
+        if not data:
+            continue
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("Dirty") is True:
+            return True
+    return False
+
+
+def cache_has_dirty_uploads() -> bool:
+    cache = open_state_dir(rel_to_home(CACHE_DIR))
+    if cache is None:
+        return False
+    try:
+        try:
+            meta_root = cache.enter("vfsMeta")
+        except (FileNotFoundError, Unsafe):
+            return False
+        try:
+            return _scan_dirty(meta_root, 0, [0])
+        finally:
+            meta_root.close()
+    finally:
+        cache.close()
+
+
+def cache_bytes() -> int:
+    total = 0
+    cache = open_state_dir(rel_to_home(CACHE_DIR))
+    if cache is None:
+        return 0
+    try:
+        stack = [cache]
+        opened_extra = []
+        while stack:
+            cur = stack.pop()
+            for entry in cur.scandir_names():
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        child = cur.enter(entry.name)
+                        opened_extra.append(child)
+                        stack.append(child)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except (OSError, Unsafe):
+                    continue
+        for d in opened_extra:
+            d.close()
+    finally:
+        cache.close()
+    return total
+
+
+# =======================================================================
+# systemctl / gio helpers
+# =======================================================================
+
+def service_main_pid() -> "int | None":
+    if not Tools.systemctl:
+        return None
+    result = run_bounded([Tools.systemctl, "--user", "show", "-p", "MainPID", "--value", UNIT_NAME], timeout=5)
+    if not result.ok:
+        return None
+    text = result.stdout.decode("ascii", "replace").strip()
+    if not text.isdigit():
+        return None
+    pid = int(text)
+    return pid if pid > 1 else None
+
+
+def service_running() -> bool:
+    if not Tools.systemctl:
+        return False
+    result = run_bounded([Tools.systemctl, "--user", "is-active", "--quiet", UNIT_NAME], timeout=5)
+    return result.returncode == 0 and not result.timed_out
+
+
+def systemctl(*args: str, timeout: float = 20) -> BoundedResult:
+    if not Tools.systemctl:
+        fail("systemctl not found")
+    return run_bounded([Tools.systemctl, "--user", *args], timeout=timeout)
+
+
+def gio_mounted() -> bool:
+    if not Tools.gio:
+        return False
+    result = run_bounded([Tools.gio, "mount", "-l"], timeout=5)
+    return DAV_URI in result.stdout.decode("utf-8", "replace")
+
+
+def label_mount() -> None:
+    if not Tools.gio:
+        return
+    run_bounded([Tools.gio, "set", "-t", "string", DAV_URI, "metadata::display-name", DISPLAY_NAME], timeout=5)
+
+
+def unmount_legacy_dav() -> None:
+    if not Tools.gio:
+        return
+    for uri in (LEGACY_URI_NO_USER, LEGACY_URI_OLD_HOST_AUTH, LEGACY_URI_OLD_HOST):
+        run_bounded([Tools.gio, "mount", "-u", uri], timeout=5)
+
+
+def unmount_dav() -> None:
+    if not Tools.gio:
+        return
+    run_bounded([Tools.gio, "mount", "-u", DAV_URI], timeout=5)
+    unmount_legacy_dav()
+
+
+# =======================================================================
+# Commands
+# =======================================================================
+
+def require_packages() -> None:
+    need_rclone = not Tools.rclone
+    need_gvfs = not (os.path.isfile("/usr/lib/gvfsd-dav") and os.access("/usr/lib/gvfsd-dav", os.X_OK))
+    if not need_rclone and not need_gvfs:
+        return
+    lines = [f"{APP}: required packages missing. Run: omarchy pkg add gvfs-dnssd rclone"]
+    if need_rclone:
+        lines.append("  - rclone \u2014 serves iCloud over WebDAV")
+    if need_gvfs:
+        lines.append("  - gvfs-dnssd \u2014 the Nautilus WebDAV backend")
+    lines.append("Then toggle Fast Fruit Drive on again.")
+    print("\n".join(lines), file=sys.stderr)
+    raise SystemExit(1)
+
+
+def cmd_ensure(_args) -> None:
+    require_packages()
+    cfg = load_config()
+    save_config(cfg)
+    # ReadWritePaths= in the unit below needs this directory to already
+    # exist: systemd sets up the bind mount before ExecStart runs, and
+    # ProtectHome=read-only would otherwise leave a fresh install with no
+    # way to create it from inside the sandboxed service.
+    ensure_state_dir(rel_to_home(CACHE_DIR)).close()
+    ensure_webdav_auth()
+    write_unit()
+    ensure_bookmark()
+    install_nautilus_extension()
+
+
+def cmd_serve(_args) -> None:
+    cfg = load_config()
+    if not Tools.rclone:
+        fail("rclone not found")
+    if not remote_configured():
+        fail(f"rclone remote '{REMOTE}' is not configured")
+    ensure_state_dir(rel_to_home(CACHE_DIR)).close()
+    # Open the config dir with a fd that survives the coming execve, so
+    # rclone can be handed "/proc/self/fd/N/webdav.htpasswd" — a path that
+    # cannot be swapped later because it resolves through the retained
+    # open directory description, not by re-walking a pathname.
+    authdir = ensure_state_dir(rel_to_home(CONFIG_DIR))
+    os.set_inheritable(authdir.fd, True)
+    try:
+        validate_webdav_auth(authdir)
+    except AuthError as exc:
+        fail(str(exc))
+    args = [
+        Tools.rclone, "serve", "webdav", REMOTE,
+        "--addr", f"{BIND_V4}:{PORT}",
+        "--addr", f"[{BIND_V6}]:{PORT}",
+        "--vfs-cache-mode", VFS_CACHE_MODE,
+        "--vfs-cache-max-size", cfg.cache_max_size,
+        "--vfs-cache-max-age", cfg.cache_max_age,
+        "--vfs-read-ahead", "0",
+        "--poll-interval", "0",
+        "--dir-cache-time", "30s",
+        "--cache-dir", CACHE_DIR,
+        "--htpasswd", f"/proc/self/fd/{authdir.fd}/{WEBDAV_HTPASSWD_FILE}",
+    ]
+    os.execve(Tools.rclone, args, sanitized_child_env())
+
+
+def wait_for_server() -> None:
+    pid = service_main_pid()
+    if pid is None:
+        fail("service MainPID unavailable")
+    if not Tools.rclone:
+        fail("rclone not found")
+    wait_webdav_ready(pid, Tools.rclone)
+
+
+def do_mount() -> None:
+    pid = service_main_pid()
+    if pid is None:
+        fail("service MainPID unavailable")
+    if not Tools.rclone:
+        fail("rclone not found")
+    unmount_legacy_dav()
+    mount_dav(pid, Tools.rclone)
+    label_mount()
+
+
+def cmd_start(_args) -> None:
+    cmd_ensure(_args)
+    if not remote_configured():
+        fail(f"rclone remote '{REMOTE}' is not configured \u2014 use Sign in on the widget")
+    if not session_present():
+        fail("iCloud session missing or expired \u2014 use Sign in on the widget")
+    systemctl("start", UNIT_NAME)
+    if not service_running():
+        fail(f"service failed to start \u2014 see: journalctl --user -u {UNIT_NAME}")
+    wait_for_server()
+    do_mount()
+    ensure_bookmark()
+
+
+def cmd_stop(_args) -> None:
+    unmount_dav()
+    systemctl("stop", UNIT_NAME, timeout=20)
+    remove_bookmark()
+
+
+def _guard_no_dirty(action: str) -> bool:
+    """Stop the service, refuse if pending uploads exist (restarting the
+    service first), otherwise leave it stopped. Returns whether it was
+    running before this call."""
+    was_running = service_running()
+    if was_running:
+        systemctl("stop", UNIT_NAME, timeout=20)
+    if cache_has_dirty_uploads():
+        if was_running:
+            systemctl("start", UNIT_NAME, timeout=20)
+        fail(f"pending uploads remain in the local cache \u2014 wait for them to finish, then {action} again")
+    return was_running
+
+
+def cmd_restart(_args) -> None:
+    cmd_ensure(_args)
+    systemctl("restart", UNIT_NAME)
+    wait_for_server()
+    do_mount()
+    ensure_bookmark()
+
+
+def cmd_toggle(args) -> None:
+    if service_running():
+        cmd_stop(args)
+    else:
+        cmd_start(args)
+
+
+def cmd_open(_args) -> None:
+    load_config()
+    if Tools.omarchy:
+        spawn_detached([Tools.omarchy, "launch", "nautilus"])
+    elif Tools.nautilus:
+        spawn_detached([Tools.nautilus, "--new-window"])
+    else:
+        fail("nautilus not found")
+    if not service_running():
+        cmd_start(_args)
+        return
+    do_mount()
+    ensure_bookmark()
+
+
+def cmd_login(_args) -> None:
+    if Tools.omarchy:
+        spawn_detached([Tools.omarchy, "launch", "tui",
+                         "--app-id=io.github.abort-retry-ignore.ff-drive-login",
+                         Tools.python3 or sys.executable, "-I", SELF_PATH, "login-tui"])
+        return
+    if Tools.xdg_terminal:
+        spawn_detached([Tools.xdg_terminal, "-e", Tools.python3 or sys.executable, "-I", SELF_PATH, "login-tui"])
+        return
+    fail(f"open a terminal and run: {SELF_PATH} login-tui")
+
+
+def cmd_login_tui(_args) -> None:
+    if not Tools.rclone:
+        fail("rclone not found")
+    print()
+    print("Fast Fruit Drive \u2014 iCloud sign-in")
+    print()
+    print("rclone stores a trust token in ~/.config/rclone/rclone.conf (not in this plugin).")
+    print("The token lasts about 30 days. After that, run Sign in again.")
+    print("Use your real Apple ID password + 2FA. App-specific passwords are rejected.")
+    print()
+    if remote_configured():
+        print(f"Reconnecting existing remote: {REMOTE}")
+        print()
+        subprocess.run([Tools.rclone, "config", "reconnect", REMOTE], env=sanitized_child_env())
+    else:
+        print(f"No '{REMOTE}' remote yet. In the rclone wizard:")
+        print("  n) New remote")
+        print(f"  name> {REMOTE_NAME}")
+        print("  Storage> iclouddrive")
+        print()
+        subprocess.run([Tools.rclone, "config"], env=sanitized_child_env())
+    print()
+    print("Done. You can close this terminal. Toggle Fast Fruit Drive on from the bar.")
+    print()
+
+
+def cmd_configure(args) -> None:
+    cfg = load_config()
+    restart = False
+    changed = False
+    for pair in args:
+        key, _, value = pair.partition("=")
+        if key == "cache_max_size":
+            if not valid_cache_size(value):
+                fail(f"invalid cache_max_size: {value}")
+            changed = changed or value != cfg.cache_max_size
+            cfg.cache_max_size = value
+        elif key == "cache_max_age_hours":
+            if not valid_cache_age_hours(value):
+                fail(f"invalid cache_max_age_hours: {value}")
+            changed = changed or int(value) != cfg.cache_max_age_hours
+            cfg.cache_max_age_hours = int(value)
+        elif key == "restart":
+            restart = bool_value(value)
+        else:
+            fail(f"unknown configure key: {key}")
+    save_config(cfg)
+    if restart and changed and service_running():
+        cmd_restart(args)
+    else:
+        ensure_bookmark()
+
+
+def cmd_clear_cache(_args) -> None:
+    freed = cache_bytes()
+    was_running = _guard_no_dirty("clear-cache")
+    home = open_home()
+    try:
+        home.remove_tree(rel_to_home(CACHE_DIR))
+    except (Unsafe, OSError) as exc:
+        if was_running:
+            systemctl("start", UNIT_NAME, timeout=20)
+        fail(f"refusing to clear unsafe cache path: {exc}")
+    finally:
+        home.close()
+    ensure_state_dir(rel_to_home(CACHE_DIR)).close()
+    if was_running:
+        systemctl("start", UNIT_NAME, timeout=20)
+        wait_for_server()
+    freed_text = _format_bytes(freed)
+    print(f"Cache cleared: {freed_text} freed from {CACHE_DIR}")
+
+
+def _format_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1000 or unit == "TB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
+        value /= 1000
+    return f"{value:.1f}TB"
+
+
+def cmd_uninstall(_args) -> None:
+    was_running = _guard_no_dirty("uninstall")
+    unmount_dav()
+    if Tools.systemctl:
+        run_bounded([Tools.systemctl, "--user", "disable", "--now", UNIT_NAME], timeout=20)
+    d = open_state_dir(rel_to_home(UNIT_DIR))
+    if d is not None:
+        try:
+            d.unlink(UNIT_NAME)
+        finally:
+            d.close()
+    d = open_state_dir(rel_to_home(WANTS_DIR))
+    if d is not None:
+        try:
+            d.unlink(UNIT_NAME)
+        finally:
+            d.close()
+    if Tools.systemctl:
+        run_bounded([Tools.systemctl, "--user", "reset-failed", UNIT_NAME], timeout=10)
+        run_bounded([Tools.systemctl, "--user", "daemon-reload"], timeout=10)
+    remove_bookmark()
+    remove_nautilus_extension()
+    home = open_home()
+    try:
+        try:
+            home.remove_tree(rel_to_home(CONFIG_DIR))
+        except (Unsafe, OSError) as exc:
+            print(f"{APP}: refusing to delete unsafe path: {CONFIG_DIR} ({exc})", file=sys.stderr)
+        try:
+            home.remove_tree(rel_to_home(CACHE_DIR))
+        except (Unsafe, OSError) as exc:
+            print(f"{APP}: refusing to delete unsafe path: {CACHE_DIR} ({exc})", file=sys.stderr)
+    finally:
+        home.close()
+    print(f"{APP}: removed unit, bookmark, emblems, {CONFIG_DIR}, and {CACHE_DIR}")
+    print(f"{APP}: left ~/.config/rclone/rclone.conf untouched (Apple session is rclone's)")
+    _ = was_running  # already stopped; nothing left to restart
+
+
+def cmd_status(_args) -> None:
+    cfg = load_config()
+    rclone_found = bool(Tools.rclone)
+    configured = rclone_found and remote_configured()
+    has_session = configured and session_present()
+    running = service_running()
+    mounted = gio_mounted()
+    gvfs = os.path.isfile("/usr/lib/gvfsd-dav") and os.access("/usr/lib/gvfsd-dav", os.X_OK)
+    used = cache_bytes()
+
+    ready = rclone_found and configured and has_session and gvfs
+    needs_login = rclone_found and (not configured or not has_session)
+
+    status_text = "Stopped"
+    if not rclone_found:
+        status_text = "rclone not found"
+    elif needs_login:
+        status_text = "Sign in to iCloud"
+    elif not gvfs:
+        status_text = "install gvfs-dnssd"
+    elif running:
+        status_text = "Connected" if mounted else "Serving"
+
+    payload = {
+        "ok": True,
+        "ready": ready,
+        "running": running,
+        "mounted": mounted,
+        "rcloneFound": rclone_found,
+        "remoteConfigured": configured,
+        "hasSession": has_session,
+        "needsLogin": needs_login,
+        "gvfsDav": gvfs,
+        "cacheUsedBytes": used,
+        "statusText": status_text,
+        "remote": REMOTE,
+        "addr": f"{BIND_V4}:{PORT}",
+        "uri": DAV_URI,
+        "displayName": DISPLAY_NAME,
+        "cacheMaxSize": cfg.cache_max_size,
+        "cacheMaxAge": cfg.cache_max_age,
+        "cachePath": CACHE_DIR,
+        "lastError": "",
+    }
+    print(json.dumps(payload))
+
+
+USAGE = f"""Usage: {APP} <command> [args]
 
 Commands:
   status                         JSON status for the bar widget
@@ -78,1086 +1582,81 @@ Commands:
   ensure                         Write unit, config, and Nautilus bookmark
   configure KEY=VAL [...]        Update config; add restart=1 to bounce rclone
   clear-cache                    Bounce rclone and wipe the local file cache
+                                  (refuses while uploads are still pending)
   uninstall                      Stop and delete unit, bookmark, emblems, config, cache
+                                  (refuses while uploads are still pending)
   help                           Show this help
-EOF
-}
+"""
 
-fail() {
-  echo "$APP: $*" >&2
-  exit 1
-}
 
-bool() {
-  case "${1,,}" in
-    1|true|yes|on) echo true ;;
-    0|false|no|off) echo false ;;
-    *) echo "$1" ;;
-  esac
-}
+def cmd_help(_args) -> None:
+    print(USAGE, end="")
 
-# ---- Safety primitives -------------------------------------------------
 
-# Every component of path (checked no-follow: symlinks rejected) must be a
-# real directory owned by this user or root and not group/world-writable.
-safe_dir() {
-  local path="$1" cur="" part owner mode
-  [[ $path == /* ]] || return 1
-  [[ $path == "/" ]] && return 0
-  IFS='/' read -r -a parts <<< "${path#/}"
-  for part in "${parts[@]}"; do
-    [[ -n $part ]] || continue
-    cur="$cur/$part"
-    [[ ! -L $cur && -d $cur ]] || return 1
-    owner=$($STAT -c '%u' "$cur")
-    mode=$($STAT -c '%a' "$cur")
-    [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
-    [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
-  done
-  return 0
-}
-
-# Same walk, but every ancestor must be root-owned (executable identity).
-safe_dir_root() {
-  local path="$1" cur="" part owner mode
-  [[ $path == /* ]] || return 1
-  [[ $path == "/" ]] && return 0
-  IFS='/' read -r -a parts <<< "${path#/}"
-  for part in "${parts[@]}"; do
-    [[ -n $part ]] || continue
-    cur="$cur/$part"
-    [[ ! -L $cur && -d $cur ]] || return 1
-    owner=$($STAT -c '%u' "$cur")
-    mode=$($STAT -c '%a' "$cur")
-    [[ $owner == 0 ]] || return 1
-    [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
-  done
-  return 0
-}
-
-# Leaf file: regular file, not a symlink, owned by this user or root.
-safe_file() {
-  local path="$1" owner
-  [[ -f $path && ! -L $path ]] || return 1
-  owner=$($STAT -c '%u' "$path")
-  [[ $owner == "$USER_UID" || $owner == 0 ]]
-}
-
-# Executable accepted only at a root-owned, symlink-free location whose
-# ancestors are all root-owned and not group/world-writable, so nothing in
-# user-writable space can shadow what the long-lived service runs.
-safe_exec() {
-  local path="$1" dir owner mode
-  [[ $path == /* ]] || return 1
-  [[ -f $path && ! -L $path && -x $path ]] || return 1
-  owner=$($STAT -c '%u' "$path")
-  mode=$($STAT -c '%a' "$path")
-  [[ $owner == 0 ]] || return 1
-  [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
-  dir=${path%/*}
-  safe_dir_root "$dir" || return 1
-  return 0
-}
-
-# Resolve a /usr/bin or /usr/local/bin path to a verified regular executable.
-# Root-owned symlinks are followed at most three hops, never through `..`,
-# and only into /usr/{bin,local/bin,lib,share}.
-verified_exec() {
-  local path="$1" target owner hops=0
-  [[ $path == /usr/bin/* || $path == /usr/local/bin/* ]] || return 1
-  while [[ -L $path ]]; do
-    hops=$((hops + 1))
-    [[ $hops -le 3 ]] || return 1
-    owner=$($STAT -c '%u' "$path")
-    [[ $owner == 0 ]] || return 1
-    safe_dir_root "${path%/*}" || return 1
-    target=$($READLINK -n "$path") || return 1
-    [[ -n $target && $target != *..* ]] || return 1
-    [[ $target == /* ]] || target="${path%/*}/$target"
-    [[ $target == /usr/bin/* || $target == /usr/local/bin/* || $target == /usr/lib/* || $target == /usr/share/* ]] || return 1
-    path=$target
-  done
-  safe_exec "$path" || return 1
-  printf '%s\n' "$path"
-}
-
-find_verified() {
-  local name="$1" candidate resolved
-  for candidate in "/usr/bin/$name" "/usr/local/bin/$name"; do
-    resolved=$(verified_exec "$candidate") || continue
-    printf '%s\n' "$resolved"
-    return 0
-  done
-  return 1
-}
-
-# Create $1 component-wise. Never follows a symlink; existing components
-# must pass safe_dir; missing components are mkdir'd and re-checked.
-ensure_dir() {
-  local path="$1" cur="" part owner mode
-  [[ $path == /* ]] || return 1
-  IFS='/' read -r -a parts <<< "${path#/}"
-  for part in "${parts[@]}"; do
-    [[ -n $part ]] || continue
-    cur="$cur/$part"
-    if [[ -L $cur || -e $cur ]]; then
-      [[ ! -L $cur && -d $cur ]] || return 1
-      owner=$($STAT -c '%u' "$cur")
-      mode=$($STAT -c '%a' "$cur")
-      [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
-      [[ $((8#$mode & 0022)) -eq 0 ]] || return 1
-    else
-      $MKDIR -m 700 "$cur" || return 1
-      [[ ! -L $cur && -d $cur ]] || return 1
-      owner=$($STAT -c '%u' "$cur")
-      [[ $owner == "$USER_UID" || $owner == 0 ]] || return 1
-    fi
-  done
-  return 0
-}
-
-# Recursive delete, descriptor-relative. The chain is validated first
-# (no symlinks, under the resolved home), then the PARENT directory is
-# pinned and the tree is wiped through inherited dir FDs: os.open with
-# O_NOFOLLOW|O_DIRECTORY at every level, os.unlink/os.rmdir with dir_fd —
-# no pathname is re-resolved, and a swap between validation and deletion
-# cannot redirect the delete.
-safe_rm_rf() {
-  local path="$1" real_home real_path parent rc=0
-  [[ -L $path ]] && return 1
-  [[ -e $path ]] || return 0
-  real_home=$($REALPATH "$HOME")
-  real_path=$($REALPATH "$path") || return 1
-  [[ $real_path == "$real_home" || $real_path == "$real_home"/* ]] || return 1
-  [[ $real_path == "$path" ]] || return 1
-  safe_dir "$path" || return 1
-  parent=${path%/*}
-  exec {rmfd}<"$parent" || return 1
-  "$BIN_PYTHON3" -I - "${path##*/}" "$rmfd" <<'PY' || rc=$?
-import os, sys
-name, parentfd = sys.argv[1], int(sys.argv[2])
-try:
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=parentfd)
-except NotADirectoryError:
-    os.unlink(name, dir_fd=parentfd)
-    sys.exit(0)
-except FileNotFoundError:
-    sys.exit(0)
-def wipe(fd):
-    for entry in os.scandir(fd):
-        if entry.is_dir(follow_symlinks=False):
-            child = os.open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
-            wipe(child)
-            os.close(child)
-            os.rmdir(entry.name, dir_fd=fd)
-        else:
-            os.unlink(entry.name, dir_fd=fd)
-wipe(fd)
-os.close(fd)
-os.rmdir(name, dir_fd=parentfd)
-PY
-  exec {rmfd}<&-
-  return $rc
-}
-
-assert_coreutils() {
-  local p
-  # stat/readlink are the bootstrap for verified_exec itself.
-  safe_exec "$STAT" || fail "refusing unverified tool: $STAT"
-  safe_exec "$READLINK" || fail "refusing unverified tool: $READLINK"
-  for p in "$MKDIR" "$REALPATH" "$CAT" "$SLEEP" "$GREP" "$AWK" "$DU" "$NUMFMT"; do
-    verified_exec "$p" >/dev/null || fail "refusing unverified tool: $p"
-  done
-}
-
-resolve_tools() {
-  assert_coreutils
-  BIN_PYTHON3=$(find_verified python3 || true)
-  BIN_SYSTEMCTL=$(find_verified systemctl || true)
-  BIN_GIO=$(find_verified gio || true)
-  BIN_JQ=$(find_verified jq || true)
-  BIN_NAUTILUS=$(find_verified nautilus || true)
-  BIN_SETSID=$(find_verified setsid || true)
-  BIN_OMARCHY=$(find_verified omarchy || true)
-  BIN_XDG_TERMINAL=$(find_verified xdg-terminal-exec || true)
-}
-
-# ---- Config value schemas ----------------------------------------------
-
-valid_bind() {
-  local value="$1" host port
-  [[ $value == *:* ]] || return 1
-  port=${value##*:}
-  host=${value%:$port}
-  [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
-  [[ 10#$port -ge 1 && 10#$port -le 65535 ]] || return 1
-  [[ $host == "127.0.0.1" || $host == "[::1]" ]]
-}
-
-valid_remote_name() {
-  [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ && $1 != -* ]]
-}
-
-valid_size() {
-  [[ $1 =~ ^[0-9]{1,7}[KMGT]?$ ]]
-}
-
-valid_age() {
-  [[ $1 =~ ^[0-9]{1,7}(s|m|h|d|w)$ ]]
-}
-
-valid_host() {
-  [[ $1 =~ ^[a-zA-Z0-9.-]{1,63}$ ]]
-}
-
-valid_display_name() {
-  [[ $1 =~ ^[[:print:]]{1,64}$ ]]
-}
-
-valid_vfs_mode() {
-  case $1 in
-    off|minimal|writes|full) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_dirs() {
-  local d
-  for d in "$CONFIG_DIR" "$CACHE_DIR" "${UNIT_FILE%/*}" "${BOOKMARKS%/*}"; do
-    ensure_dir "$d" || fail "refusing to use unsafe directory: $d"
-  done
-}
-
-# ---- Descriptor-relative state handling --------------------------------
-# Every write, read, and delete below resolves against a directory FD that
-# is pinned immediately after validation. The pinned descriptor retains the
-# validated directory's identity, so a pathname swap after validation
-# cannot redirect plugin state: nothing re-resolves a path. Leaf entries
-# are opened with O_NOFOLLOW and destinations are replaced atomically
-# (O_EXCL temp + rename), so a swapped symlink is refused or superseded
-# rather than followed. The pinned FDs are inherited by the python children
-# that perform the descriptor-relative work.
-
-# fd_write NAME DIRFD MODE — stdin becomes pinned-dir/NAME, atomically.
-# The script travels via -c so stdin carries the content being written.
-fd_write() {
-  local name="$1" dirfd="$2" mode="$3"
-  "$BIN_PYTHON3" -I -c '
-import os, sys
-name, dirfd, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3], 8)
-data = sys.stdin.buffer.read(1048577)
-if len(data) > 1048576:
-    sys.exit(2)
-tmp = ".ff-" + os.urandom(10).hex()
-fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=dirfd)
-with os.fdopen(fd, "wb") as fh:
-    fh.write(data)
-os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
-' "$name" "$dirfd" "$mode"
-}
-
-# fd_unlink DIRFD NAME... — remove leaf entries inside the pinned directory
-# (unlinkat never follows symlinks; missing entries are ignored).
-fd_unlink() {
-  local dirfd="$1"
-  shift
-  "$BIN_PYTHON3" -I - "$dirfd" "$@" <<'PY'
-import os, sys
-dirfd = int(sys.argv[1])
-for name in sys.argv[2:]:
+def cmd_supervise(args) -> None:
+    """QML entry point: run COMMAND ARGS... as an isolated child, capping
+    its raw stdout/stderr in bytes *before* any line parsing happens, and
+    enforcing a hard wall-clock deadline. Never used for `serve` (the
+    long-running systemd service) or `login-tui` (an interactive session)."""
+    if len(args) < 2:
+        fail("usage: __supervise TIMEOUT COMMAND [ARGS...]")
     try:
-        os.unlink(name, dir_fd=dirfd)
-    except OSError:
-        pass
-PY
+        timeout = float(args[0])
+    except ValueError:
+        fail("invalid supervise timeout")
+    command = args[1]
+    if command not in SUPERVISABLE_COMMANDS:
+        fail(f"refusing to supervise command: {command}")
+    python3 = Tools.python3 or find_verified("python3")
+    if not python3:
+        fail("python3 not found")
+    child_argv = [python3, "-I", SELF_PATH, command, *args[2:]]
+    result = run_bounded(child_argv, timeout=timeout, cap=OUTPUT_CAP)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    if result.timed_out:
+        sys.stderr.write(f"\n{APP}: command timed out after {timeout:g}s\n")
+        raise SystemExit(124)
+    if result.overflowed:
+        sys.stderr.write(f"\n{APP}: command output exceeded {OUTPUT_CAP} bytes\n")
+        raise SystemExit(125)
+    raise SystemExit(result.returncode)
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "start": cmd_start,
+    "stop": cmd_stop,
+    "restart": cmd_restart,
+    "toggle": cmd_toggle,
+    "open": cmd_open,
+    "login": cmd_login,
+    "login-tui": cmd_login_tui,
+    "serve": cmd_serve,
+    "ensure": cmd_ensure,
+    "configure": cmd_configure,
+    "clear-cache": cmd_clear_cache,
+    "uninstall": cmd_uninstall,
+    "help": cmd_help,
 }
 
-save_config() {
-  ensure_dirs
-  exec {cfgfd}<"$CONFIG_DIR" || fail "cannot pin config directory"
-  fd_write "config" "$cfgfd" 600 <<EOF
-remote=$remote
-bind=$bind
-dav_host=$dav_host
-cache_max_size=$cache_max_size
-cache_max_age=$cache_max_age
-display_name=$display_name
-vfs_cache_mode=$vfs_cache_mode
-EOF
-  exec {cfgfd}<&-
-}
 
-write_default_config() {
-  ensure_dirs
-  if [[ ! -f $CONFIG_FILE ]]; then
-    remote=$DEFAULT_REMOTE
-    bind=$DEFAULT_BIND
-    dav_host=$DEFAULT_DAV_HOST
-    cache_max_size=$DEFAULT_CACHE_MAX_SIZE
-    cache_max_age=$DEFAULT_CACHE_MAX_AGE
-    display_name=$DEFAULT_DISPLAY_NAME
-    vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
-    save_config
-  fi
-}
+def main(argv: "list[str]") -> None:
+    command = argv[0] if argv else "help"
+    rest = argv[1:]
+    if command == "__supervise":
+        resolve_tools()
+        cmd_supervise(rest)
+        return
+    if command not in COMMANDS:
+        fail(f"unknown command: {command}")
+    if command == "serve":
+        global _EXTRA_TRUSTED_UIDS
+        _EXTRA_TRUSTED_UIDS = frozenset({_overflow_uid()})
+    if command != "help":
+        resolve_tools()
+    COMMANDS[command](rest)
 
-load_config() {
-  write_default_config
-  remote=$DEFAULT_REMOTE
-  bind=$DEFAULT_BIND
-  dav_host=$DEFAULT_DAV_HOST
-  cache_max_size=$DEFAULT_CACHE_MAX_SIZE
-  cache_max_age=$DEFAULT_CACHE_MAX_AGE
-  display_name=$DEFAULT_DISPLAY_NAME
-  vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
-  local key value cfg_size remote_name
-  cfg_size=$($STAT -c '%s' "$CONFIG_FILE" 2>/dev/null || echo 65537)
-  if [[ 10#$cfg_size -le 65536 ]]; then
-    while IFS='=' read -r key value; do
-      [[ -z ${key:-} || $key == \#* ]] && continue
-      case $key in
-        remote) remote=$value ;;
-        bind) bind=$value ;;
-        addr)
-          # Migrate v0.1 bind-only configs.
-          bind=$value
-          dav_host=$DEFAULT_DAV_HOST
-          ;;
-        dav_host) dav_host=$value ;;
-        cache_max_size) cache_max_size=$value ;;
-        cache_max_age) cache_max_age=$value ;;
-        display_name) display_name=$value ;;
-        vfs_cache_mode) vfs_cache_mode=$value ;;
-      esac
-    done <"$CONFIG_FILE"
-  else
-    echo "$APP: config is oversized, using defaults" >&2
-  fi
-  # Strict schemas: anything invalid falls back to the documented default.
-  remote_name=${remote%:}
-  if ! valid_remote_name "$remote_name"; then
-    echo "$APP: invalid remote '$remote' in config, using default" >&2
-    remote_name=${DEFAULT_REMOTE%:}
-  fi
-  remote="${remote_name}:"
-  if ! valid_bind "$bind"; then
-    echo "$APP: invalid bind '$bind' in config, using default" >&2
-    bind=$DEFAULT_BIND
-  fi
-  if ! valid_size "$cache_max_size"; then
-    echo "$APP: invalid cache_max_size '$cache_max_size' in config, using default" >&2
-    cache_max_size=$DEFAULT_CACHE_MAX_SIZE
-  fi
-  if ! valid_age "$cache_max_age"; then
-    echo "$APP: invalid cache_max_age '$cache_max_age' in config, using default" >&2
-    cache_max_age=$DEFAULT_CACHE_MAX_AGE
-  fi
-  if ! valid_host "$dav_host"; then
-    echo "$APP: invalid dav_host '$dav_host' in config, using default" >&2
-    dav_host=$DEFAULT_DAV_HOST
-  fi
-  if ! valid_display_name "$display_name"; then
-    echo "$APP: invalid display_name in config, using default" >&2
-    display_name=$DEFAULT_DISPLAY_NAME
-  fi
-  if ! valid_vfs_mode "$vfs_cache_mode"; then
-    echo "$APP: invalid vfs_cache_mode '$vfs_cache_mode' in config, using default" >&2
-    vfs_cache_mode=$DEFAULT_VFS_CACHE_MODE
-  fi
-  port=${bind##*:}
-  dav_uri="dav://${WEBDAV_USER}@${dav_host}:${port}/"
-  legacy_uri="dav://${dav_host}:${port}/"
-  old_auth_uri="dav://${WEBDAV_USER}@127.0.0.1:${port}/"
-  old_uri="dav://127.0.0.1:${port}/"
-}
 
-find_rclone() {
-  find_verified rclone || true
-}
-
-remote_configured() {
-  local rclone_bin=$1
-  [[ -n $rclone_bin ]] || return 1
-  "$rclone_bin" listremotes 2>/dev/null | $GREP -Fxq "$remote"
-}
-
-# True when rclone.conf has a session for the remote (trust_token or cookies).
-# Does not print secrets. File contents are passed on stdin, never by path.
-session_present() {
-  local name=${remote%:} sz
-  [[ -n $BIN_PYTHON3 ]] || return 1
-  [[ -f $RCLONE_CONF && ! -L $RCLONE_CONF ]] || return 1
-  sz=$($STAT -c '%s' "$RCLONE_CONF" 2>/dev/null || echo 1048577)
-  [[ 10#$sz -le 1048576 ]] || return 1
-  "$BIN_PYTHON3" -I -c '
-import configparser, sys
-section = sys.argv[1]
-blob = sys.stdin.read(1048577)
-if len(blob) > 1048576:
-    sys.exit(1)
-c = configparser.ConfigParser()
-try:
-    c.read_string(blob)
-except Exception:
-    sys.exit(1)
-if not c.has_section(section):
-    sys.exit(1)
-token = c.get(section, "trust_token", fallback="").strip()
-cookies = c.get(section, "cookies", fallback="").strip()
-sys.exit(0 if token or cookies else 1)
-' "$name" < "$RCLONE_CONF"
-}
-
-write_unit() {
-  load_config
-  ensure_dir "${UNIT_FILE%/*}" || fail "refusing to use unsafe unit directory"
-  exec {unitfd}<"${UNIT_FILE%/*}" || fail "cannot pin unit directory"
-  fd_write "$UNIT" "$unitfd" 644 <<EOF
-[Unit]
-Description=Fast Fruit Drive — rclone iCloud WebDAV for Nautilus
-After=network-online.target
-Wants=network-online.target
-
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-ExecStart=$HERE/$APP serve
-Restart=on-failure
-RestartSec=5s
-Environment=PATH=/usr/bin
-UnsetEnvironment=BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH
-NoNewPrivileges=yes
-UMask=0077
-LimitNOFILE=65536
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=$APP
-
-[Install]
-WantedBy=default.target
-EOF
-  exec {unitfd}<&-
-  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
-  "$BIN_SYSTEMCTL" --user daemon-reload
-  "$BIN_SYSTEMCTL" --user enable "$UNIT" >/dev/null
-}
-
-# Atomic bookmark rewrite, entirely descriptor-relative against the
-# pinned gtk-3.0 directory: existing lines are read with O_NOFOLLOW
-# (capped at 1 MiB, owner-checked), our dav entries are filtered out, $1 is
-# appended if non-empty, and the result replaces the file atomically.
-rewrite_bookmarks() {
-  local append="${1:-}" dir rc=0
-  dir=${BOOKMARKS%/*}
-  ensure_dir "$dir" || fail "refusing to touch unsafe bookmarks directory: $dir"
-  exec {bmfd}<"$dir" || fail "cannot pin bookmarks directory"
-  "$BIN_PYTHON3" -I - "$bmfd" "$dav_uri" "$old_uri" "$append" <<'PY' || rc=$?
-import os, stat, sys
-dirfd, dav_uri, old_uri, append = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-existing = b""
-fd = None
-try:
-    fd = os.open("bookmarks", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-except FileNotFoundError:
-    fd = None
-except OSError:
-    sys.exit(2)
-if fd is not None:
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (os.getuid(), 0) or st.st_size > 1048576:
-            sys.exit(2)
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk or len(existing) > 1048576:
-                break
-            existing += chunk
-        if len(existing) > 1048576:
-            sys.exit(2)
-    finally:
-        os.close(fd)
-lines = existing.decode("utf-8", "replace").splitlines()
-keep = [
-    l for l in lines
-    if not (l.startswith("dav://") and (
-        "iCloud Drive" in l or "iCloud WebDAV" in l
-        or l.startswith(dav_uri) or l.startswith(old_uri)))
-]
-if append:
-    keep.append(append)
-data = ("\n".join(keep) + "\n").encode("utf-8", "replace") if keep else b""
-tmp = ".ff-" + os.urandom(10).hex()
-wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
-with os.fdopen(wfd, "wb") as fh:
-    fh.write(data)
-os.rename(tmp, "bookmarks", src_dir_fd=dirfd, dst_dir_fd=dirfd)
-PY
-  exec {bmfd}<&-
-  [[ $rc -eq 0 ]] || fail "cannot rewrite bookmarks safely"
-}
-
-ensure_bookmark() {
-  load_config
-  rewrite_bookmarks "$dav_uri $display_name"
-}
-
-ensure_webdav_auth() {
-  ensure_dirs
-  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
-  [[ -f $WEBDAV_AUTH_HELPER && ! -L $WEBDAV_AUTH_HELPER ]] || fail "local WebDAV auth helper missing"
-  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
-  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" ensure "$authfd" "$WEBDAV_USER"
-  exec {authfd}<&-
-}
-
-service_main_pid() {
-  local pid
-  [[ -n $BIN_SYSTEMCTL ]] || return 1
-  pid=$("$BIN_SYSTEMCTL" --user show -p MainPID --value "$UNIT") || return 1
-  [[ $pid =~ ^[0-9]+$ && $pid -gt 1 ]] || return 1
-  printf '%s\n' "$pid"
-}
-
-service_running() {
-  [[ -n $BIN_SYSTEMCTL ]] || return 1
-  "$BIN_SYSTEMCTL" --user is-active --quiet "$UNIT"
-}
-
-gio_mounted() {
-  load_config
-  [[ -n $BIN_GIO ]] || return 1
-  "$BIN_GIO" mount -l 2>/dev/null | $GREP -Fq "$dav_uri"
-}
-
-label_mount() {
-  load_config
-  [[ -n $BIN_GIO ]] || return 0
-  "$BIN_GIO" set -t string "$dav_uri" metadata::display-name "$display_name" >/dev/null 2>&1 || true
-}
-
-unmount_legacy_dav() {
-  load_config
-  [[ -n $BIN_GIO ]] || return 0
-  "$BIN_GIO" mount -u "$legacy_uri" >/dev/null 2>&1 || true
-  "$BIN_GIO" mount -u "$old_auth_uri" >/dev/null 2>&1 || true
-  "$BIN_GIO" mount -u "$old_uri" >/dev/null 2>&1 || true
-}
-
-mount_dav() {
-  load_config
-  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
-  local pid rclone_bin
-  pid=$(service_main_pid) || fail "service MainPID unavailable"
-  rclone_bin=$(find_rclone)
-  [[ -n $rclone_bin ]] || fail "rclone not found"
-  unmount_legacy_dav
-  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
-  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" mount "$authfd" "$WEBDAV_USER" "$dav_uri" "$pid" "$port" "$rclone_bin"
-  exec {authfd}<&-
-  label_mount
-}
-
-unmount_dav() {
-  load_config
-  [[ -n $BIN_GIO ]] || return 0
-  "$BIN_GIO" mount -u "$dav_uri" >/dev/null 2>&1 || true
-  unmount_legacy_dav
-}
-
-cache_bytes() {
-  if [[ -d $CACHE_DIR ]]; then
-    $DU -sb "$CACHE_DIR" 2>/dev/null | $AWK '{print $1}'
-  else
-    echo 0
-  fi
-}
-
-install_nautilus_extension() {
-  local src dir rc=0
-  src="$PLUGIN_DIR/nautilus/fast_fruit_drive_nautilus.py"
-  dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
-  [[ -f $src ]] || return 0
-  ensure_dir "$dir" || fail "refusing to touch unsafe extension directory: $dir"
-  exec {extfd}<"$dir" || fail "cannot pin extension directory"
-  "$BIN_PYTHON3" -I - "$src" "$extfd" <<'PY' || rc=$?
-import os, stat, sys
-src, dirfd = sys.argv[1], int(sys.argv[2])
-sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW)
-try:
-    st = os.fstat(sfd)
-    if not stat.S_ISREG(st.st_mode) or st.st_size > 2097152:
-        sys.exit(2)
-    data = b""
-    while True:
-        chunk = os.read(sfd, 65536)
-        if not chunk or len(data) > 2097152:
-            break
-        data += chunk
-finally:
-    os.close(sfd)
-if len(data) > 2097152:
-    sys.exit(2)
-existing = None
-try:
-    efd = os.open("fast_fruit_drive_nautilus.py", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-except FileNotFoundError:
-    efd = None
-except OSError:
-    sys.exit(2)
-if efd is not None:
-    try:
-        st = os.fstat(efd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid not in (os.getuid(), 0) or st.st_size > 2097152:
-            sys.exit(2)
-        existing = b""
-        while True:
-            chunk = os.read(efd, 65536)
-            if not chunk or len(existing) > 2097152:
-                break
-            existing += chunk
-    finally:
-        os.close(efd)
-if existing == data:
-    sys.exit(0)
-tmp = ".ff-" + os.urandom(10).hex()
-wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dirfd)
-with os.fdopen(wfd, "wb") as fh:
-    fh.write(data)
-os.rename(tmp, "fast_fruit_drive_nautilus.py", src_dir_fd=dirfd, dst_dir_fd=dirfd)
-PY
-  exec {extfd}<&-
-  [[ $rc -eq 0 ]] || fail "cannot install Nautilus extension safely"
-}
-
-# Abort before writing anything unless every required package is present.
-# The fix command leads the message so the widget's one-line error stays useful.
-require_packages() {
-  local need_rclone=false need_gvfs=false
-  [[ -n $(find_rclone) ]] || need_rclone=true
-  [[ -x /usr/lib/gvfsd-dav ]] || need_gvfs=true
-  if [[ $need_rclone == false && $need_gvfs == false ]]; then
-    return 0
-  fi
-  {
-    echo "$APP: required packages missing. Run: omarchy pkg add gvfs-dnssd rclone"
-    [[ $need_rclone == true ]] && echo "  - rclone — serves iCloud over WebDAV"
-    [[ $need_gvfs == true ]] && echo "  - gvfs-dnssd — the Nautilus WebDAV backend"
-    echo "Then toggle Fast Fruit Drive on again."
-  } >&2
-  exit 1
-}
-
-cmd_ensure() {
-  require_packages
-  load_config
-  save_config
-  ensure_webdav_auth
-  write_unit
-  ensure_bookmark
-  install_nautilus_extension
-}
-
-cmd_serve() {
-  load_config
-  local rclone_bin
-  rclone_bin=$(find_rclone)
-  [[ -n $rclone_bin ]] || fail "rclone not found"
-  remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured"
-  ensure_dir "$CACHE_DIR" || fail "refusing to use unsafe cache directory: $CACHE_DIR"
-  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
-  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" validate "$authfd" "$WEBDAV_USER"
-  local args=(
-    serve webdav "$remote"
-    --addr "$bind"
-    --addr "[::1]:${port}"
-    --vfs-cache-mode "$vfs_cache_mode"
-    --vfs-cache-max-size "$cache_max_size"
-    --vfs-cache-max-age "$cache_max_age"
-    --vfs-read-ahead 0
-    --poll-interval 0
-    --dir-cache-time 30s
-    --cache-dir "$CACHE_DIR"
-    --htpasswd "/proc/self/fd/${authfd}/webdav.htpasswd"
-  )
-  exec "$rclone_bin" "${args[@]}"
-}
-
-wait_for_server() {
-  load_config
-  [[ -n $BIN_PYTHON3 ]] || fail "python3 not found"
-  local pid rclone_bin
-  pid=$(service_main_pid) || fail "service MainPID unavailable"
-  rclone_bin=$(find_rclone)
-  [[ -n $rclone_bin ]] || fail "rclone not found"
-  exec {authfd}<"$CONFIG_DIR" || fail "cannot pin auth directory"
-  "$BIN_PYTHON3" -I "$WEBDAV_AUTH_HELPER" wait "$authfd" "$WEBDAV_USER" "$pid" "$port" "$rclone_bin"
-  exec {authfd}<&-
-}
-
-cmd_start() {
-  cmd_ensure
-  local rclone_bin
-  rclone_bin=$(find_rclone)
-  remote_configured "$rclone_bin" || fail "rclone remote '$remote' is not configured — use Sign in on the widget"
-  session_present || fail "iCloud session missing or expired — use Sign in on the widget"
-  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
-  "$BIN_SYSTEMCTL" --user start "$UNIT"
-  service_running || fail "service failed to start — see: journalctl --user -u $UNIT"
-  wait_for_server || fail "WebDAV did not become ready on http://${bind}/"
-  mount_dav
-  ensure_bookmark
-}
-
-cmd_stop() {
-  unmount_dav
-  [[ -n $BIN_SYSTEMCTL ]] || return 0
-  "$BIN_SYSTEMCTL" --user stop "$UNIT" 2>/dev/null || true
-  remove_bookmark
-}
-
-cmd_restart() {
-  cmd_ensure
-  [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
-  "$BIN_SYSTEMCTL" --user restart "$UNIT"
-  wait_for_server || fail "WebDAV did not become ready on http://${bind}/"
-  mount_dav
-  ensure_bookmark
-}
-
-cmd_toggle() {
-  if service_running; then
-    cmd_stop
-  else
-    cmd_start
-  fi
-}
-
-cmd_open() {
-  load_config
-  # Same path as Super-Shift-F: `omarchy launch nautilus` →
-  # `setsid uwsm-app -- nautilus --new-window`. Do not pass the DAV URI —
-  # the first gvfs connect after login is slow, and the sidebar bookmark
-  # is enough to get to iCloud Drive.
-  if [[ -n $BIN_OMARCHY ]]; then
-    "$BIN_OMARCHY" launch nautilus >/dev/null 2>&1 &
-  else
-    [[ -n $BIN_SETSID && -n $BIN_NAUTILUS ]] || fail "nautilus not found"
-    "$BIN_SETSID" "$BIN_NAUTILUS" --new-window >/dev/null 2>&1 &
-  fi
-  service_running || cmd_start
-  mount_dav
-  ensure_bookmark
-}
-
-cmd_login() {
-  if [[ -n $BIN_OMARCHY ]]; then
-    "$BIN_OMARCHY" launch tui --app-id=io.github.abort-retry-ignore.ff-drive-login "$HERE/$APP" login-tui
-    return
-  fi
-  if [[ -n $BIN_XDG_TERMINAL ]]; then
-    "$BIN_XDG_TERMINAL" -e "$HERE/$APP" login-tui
-    return
-  fi
-  fail "open a terminal and run: $HERE/$APP login-tui"
-}
-
-cmd_login_tui() {
-  load_config
-  local rclone_bin
-  rclone_bin=$(find_rclone)
-  [[ -n $rclone_bin ]] || fail "rclone not found"
-  echo
-  echo "Fast Fruit Drive — iCloud sign-in"
-  echo
-  echo "rclone stores a trust token in ~/.config/rclone/rclone.conf (not in this plugin)."
-  echo "The token lasts about 30 days. After that, run Sign in again."
-  echo "Use your real Apple ID password + 2FA. App-specific passwords are rejected."
-  echo
-  if remote_configured "$rclone_bin"; then
-    echo "Reconnecting existing remote: $remote"
-    echo
-    "$rclone_bin" config reconnect "$remote"
-  else
-    echo "No '$remote' remote yet. In the rclone wizard:"
-    echo "  n) New remote"
-    echo "  name> icloud"
-    echo "  Storage> iclouddrive"
-    echo
-    "$rclone_bin" config
-  fi
-  echo
-  echo "Done. You can close this terminal. Toggle Fast Fruit Drive on from the bar."
-  echo
-}
-
-cmd_configure() {
-  load_config
-  local restart=false
-  local key value rname changed=false
-  for pair in "$@"; do
-    key=${pair%%=*}
-    value=${pair#*=}
-    case $key in
-      cache_max_size)
-        valid_size "$value" || fail "invalid cache_max_size: $value"
-        [[ $value == "$cache_max_size" ]] || changed=true
-        cache_max_size=$value
-        ;;
-      cache_max_age)
-        valid_age "$value" || fail "invalid cache_max_age: $value"
-        [[ $value == "$cache_max_age" ]] || changed=true
-        cache_max_age=$value
-        ;;
-      cache_max_age_hours)
-        value="${value}h"
-        valid_age "$value" || fail "invalid cache_max_age_hours: $value"
-        [[ $value == "$cache_max_age" ]] || changed=true
-        cache_max_age=$value
-        ;;
-      remote)
-        rname=${value%:}
-        valid_remote_name "$rname" || fail "invalid remote name: $value"
-        value="${rname}:"
-        [[ $value == "$remote" ]] || changed=true
-        remote=$value
-        ;;
-      bind)
-        valid_bind "$value" || fail "invalid bind (loopback host only): $value"
-        [[ $value == "$bind" ]] || changed=true
-        bind=$value
-        ;;
-      dav_host)
-        valid_host "$value" || fail "invalid dav_host: $value"
-        [[ $value == "$dav_host" ]] || changed=true
-        dav_host=$value
-        ;;
-      display_name)
-        valid_display_name "$value" || fail "invalid display_name: $value"
-        [[ $value == "$display_name" ]] || changed=true
-        display_name=$value
-        ;;
-      vfs_cache_mode)
-        valid_vfs_mode "$value" || fail "invalid vfs_cache_mode: $value"
-        [[ $value == "$vfs_cache_mode" ]] || changed=true
-        vfs_cache_mode=$value
-        ;;
-      restart) restart=$(bool "$value") ;;
-      *) fail "unknown configure key: $key" ;;
-    esac
-  done
-  save_config
-  if [[ $restart == true && $changed == true ]] && service_running; then
-    cmd_restart
-  else
-    ensure_bookmark
-  fi
-}
-
-cmd_clear_cache() {
-  # Safe, near-instant cache wipe: rclone only reconciles its in-memory VFS
-  # index at startup, so the file cache cannot be purged while it runs. Stop
-  # the unit, wipe, start, and skip the slow parts (gio mount, bookmark, unit
-  # rewrite) — WebDAV is stateless, gio reconnects on its own.
-  local was_running=false freed
-  freed=$(cache_bytes)
-  service_running && was_running=true
-  if [[ $was_running == true ]]; then
-    [[ -n $BIN_SYSTEMCTL ]] || fail "systemctl not found"
-    "$BIN_SYSTEMCTL" --user stop "$UNIT" || fail "could not stop $UNIT"
-  fi
-  if ! safe_rm_rf "$CACHE_DIR"; then
-    if [[ $was_running == true ]]; then
-      "$BIN_SYSTEMCTL" --user start "$UNIT" || true
-    fi
-    fail "refusing to clear unsafe cache path: $CACHE_DIR"
-  fi
-  if ! ensure_dir "$CACHE_DIR"; then
-    if [[ $was_running == true ]]; then
-      "$BIN_SYSTEMCTL" --user start "$UNIT" || true
-    fi
-    fail "refusing to use unsafe cache path: $CACHE_DIR"
-  fi
-  if [[ $was_running == true ]]; then
-    "$BIN_SYSTEMCTL" --user start "$UNIT" || fail "could not start $UNIT"
-    wait_for_server || fail "WebDAV did not come back — see: journalctl --user -u $UNIT"
-  fi
-  echo "Cache cleared: $($NUMFMT --to=iec "$freed") freed from $CACHE_DIR"
-}
-
-remove_bookmark() {
-  local port
-  [[ -f $BOOKMARKS ]] || return 0
-  if [[ -f $CONFIG_FILE ]]; then
-    load_config
-  else
-    port=${DEFAULT_BIND##*:}
-    dav_uri="dav://${DEFAULT_DAV_HOST}:${port}/"
-    old_uri="dav://127.0.0.1:${port}/"
-  fi
-  rewrite_bookmarks ""
-}
-
-remove_nautilus_extension() {
-  local dir rc=0
-  dir="${XDG_DATA_HOME:-$HOME/.local/share}/nautilus-python/extensions"
-  ensure_dir "$dir" 2>/dev/null || return 0
-  exec {extfd}<"$dir" 2>/dev/null || return 0
-  "$BIN_PYTHON3" -I - "$extfd" <<'PY' || rc=$?
-import os, sys
-dirfd = int(sys.argv[1])
-try:
-    os.unlink("fast_fruit_drive_nautilus.py", dir_fd=dirfd)
-except OSError:
-    pass
-try:
-    pycfd = os.open("__pycache__", os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=dirfd)
-except OSError:
-    sys.exit(0)
-try:
-    for entry in os.scandir(pycfd):
-        if entry.name.startswith("fast_fruit_drive_nautilus"):
-            try:
-                os.unlink(entry.name, dir_fd=pycfd)
-            except OSError:
-                pass
-finally:
-    os.close(pycfd)
-PY
-  exec {extfd}<&-
-  return $rc
-}
-
-cmd_uninstall() {
-  cmd_stop
-  if [[ -n $BIN_SYSTEMCTL ]]; then
-    "$BIN_SYSTEMCTL" --user disable --now "$UNIT" >/dev/null 2>&1 || true
-  fi
-  local wants_dir
-  if ensure_dir "${UNIT_FILE%/*}" 2>/dev/null; then
-    if exec {undfd}<"${UNIT_FILE%/*}"; then
-      fd_unlink "$undfd" "$UNIT"
-      exec {undfd}<&-
-    fi
-  fi
-  wants_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/default.target.wants"
-  if ensure_dir "$wants_dir" 2>/dev/null; then
-    if exec {wfd}<"$wants_dir"; then
-      fd_unlink "$wfd" "$UNIT"
-      exec {wfd}<&-
-    fi
-  fi
-  if [[ -n $BIN_SYSTEMCTL ]]; then
-    "$BIN_SYSTEMCTL" --user reset-failed "$UNIT" >/dev/null 2>&1 || true
-    "$BIN_SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
-  fi
-  remove_bookmark
-  remove_nautilus_extension
-  safe_rm_rf "$CONFIG_DIR" || echo "$APP: refusing to delete unsafe path: $CONFIG_DIR" >&2
-  safe_rm_rf "$CACHE_DIR" || echo "$APP: refusing to delete unsafe path: $CACHE_DIR" >&2
-  echo "$APP: removed unit, bookmark, emblems, $CONFIG_DIR, and $CACHE_DIR"
-  echo "$APP: left ~/.config/rclone/rclone.conf untouched (Apple session is rclone's)"
-}
-
-cmd_status() {
-  load_config
-  [[ -n $BIN_JQ ]] || fail "jq not found"
-  local rclone_bin running mounted configured gvfs rclone_found cache_used has_session
-  rclone_bin=$(find_rclone)
-  rclone_found=false
-  [[ -n $rclone_bin ]] && rclone_found=true
-  configured=false
-  if [[ $rclone_found == true ]] && remote_configured "$rclone_bin"; then
-    configured=true
-  fi
-  has_session=false
-  if [[ $configured == true ]] && session_present; then
-    has_session=true
-  fi
-  running=false
-  service_running && running=true
-  mounted=false
-  gio_mounted && mounted=true
-  gvfs=false
-  [[ -x /usr/lib/gvfsd-dav ]] && gvfs=true
-  cache_used=$(cache_bytes)
-  local ready=false
-  [[ $rclone_found == true && $configured == true && $has_session == true && $gvfs == true ]] && ready=true
-  local needs_login=false
-  [[ $rclone_found == true && ( $configured != true || $has_session != true ) ]] && needs_login=true
-  local status_text="Stopped"
-  if [[ $rclone_found != true ]]; then
-    status_text="rclone not found"
-  elif [[ $needs_login == true ]]; then
-    status_text="Sign in to iCloud"
-  elif [[ $gvfs != true ]]; then
-    status_text="install gvfs-dnssd"
-  elif [[ $running == true ]]; then
-    status_text="Connected"
-    [[ $mounted == true ]] || status_text="Serving"
-  fi
-  $BIN_JQ -n \
-    --argjson ok true \
-    --argjson ready "$ready" \
-    --argjson running "$running" \
-    --argjson mounted "$mounted" \
-    --argjson rcloneFound "$rclone_found" \
-    --argjson remoteConfigured "$configured" \
-    --argjson hasSession "$has_session" \
-    --argjson needsLogin "$needs_login" \
-    --argjson gvfsDav "$gvfs" \
-    --argjson cacheUsedBytes "$cache_used" \
-    --arg statusText "$status_text" \
-    --arg remote "$remote" \
-    --arg addr "$bind" \
-    --arg uri "$dav_uri" \
-    --arg displayName "$display_name" \
-    --arg cacheMaxSize "$cache_max_size" \
-    --arg cacheMaxAge "$cache_max_age" \
-    --arg cachePath "$CACHE_DIR" \
-    --arg lastError "" \
-    '{
-      ok: $ok,
-      ready: $ready,
-      running: $running,
-      mounted: $mounted,
-      rcloneFound: $rcloneFound,
-      remoteConfigured: $remoteConfigured,
-      hasSession: $hasSession,
-      needsLogin: $needsLogin,
-      gvfsDav: $gvfsDav,
-      cacheUsedBytes: $cacheUsedBytes,
-      statusText: $statusText,
-      remote: $remote,
-      addr: $addr,
-      uri: $uri,
-      displayName: $displayName,
-      cacheMaxSize: $cacheMaxSize,
-      cacheMaxAge: $cacheMaxAge,
-      cachePath: $cachePath,
-      lastError: $lastError
-    }'
-}
-
-resolve_tools
-
-cmd=${1:-help}
-shift || true
-case $cmd in
-  status) cmd_status ;;
-  start) cmd_start ;;
-  stop) cmd_stop ;;
-  restart) cmd_restart ;;
-  toggle) cmd_toggle ;;
-  open) cmd_open ;;
-  login) cmd_login ;;
-  login-tui) cmd_login_tui ;;
-  serve) cmd_serve ;;
-  ensure) cmd_ensure ;;
-  configure) cmd_configure "$@" ;;
-  clear-cache) cmd_clear_cache ;;
-  uninstall) cmd_uninstall ;;
-  help|-h|--help) usage ;;
-  *) fail "unknown command: $cmd" ;;
-esac
+if __name__ == "__main__":
+    main(sys.argv[1:])
