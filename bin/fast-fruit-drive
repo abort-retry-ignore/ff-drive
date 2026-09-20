@@ -47,7 +47,14 @@ import sys
 import time
 
 APP = "fast-fruit-drive"
+PLUGIN_ID = "io.github.abort-retry-ignore.ff-drive"
 UNIT_NAME = "fast-fruit-drive.service"
+LIFECYCLE_SERVICE_NAME = "fast-fruit-drive-lifecycle.service"
+LIFECYCLE_PATH_NAME = "fast-fruit-drive-lifecycle.path"
+GUARD_SOURCE_NAME = "fast-fruit-drive-guard.py"
+GUARD_INSTALLED_NAME = "lifecycle-guard"
+GUARD_SOURCE_CAP = 262_144
+MANIFEST_CAP = 65_536
 
 # ---------------------------------------------------------------------
 # Fixed identity. None of this is configurable: there is no UI for it, and
@@ -115,6 +122,9 @@ WANTS_DIR = os.path.join(UNIT_DIR, "default.target.wants")
 BOOKMARKS_DIR = os.path.join(HOME, ".config", "gtk-3.0")
 RCLONE_CONF_DIR = os.path.join(HOME, ".config", "rclone")
 EXTENSION_DIR = os.path.join(HOME, ".local", "share", "nautilus-python", "extensions")
+PLUGIN_REL = f".config/omarchy/plugins/{PLUGIN_ID}"
+PLUGIN_CHECKOUT = os.path.join(HOME, PLUGIN_REL)
+GUARD_INSTALLED = os.path.join(CONFIG_DIR, GUARD_INSTALLED_NAME)
 
 
 # =======================================================================
@@ -364,6 +374,70 @@ def open_state_dir(rel_path: str) -> "SafeDir | None":
 
 def rel_to_home(path: str) -> str:
     return os.path.relpath(path, HOME)
+
+
+def _open_expected_plugin_dir() -> SafeDir:
+    """Open the one marketplace checkout this plugin is allowed to use.
+
+    This deliberately uses the fixed plugin ID below the passwd-derived home,
+    rather than HERE/realpath or any inherited XDG/HOME value. The returned
+    descriptor remains valid even if a pathname is swapped after opening.
+    """
+    with open_home() as home:
+        return home.walk(PLUGIN_REL)
+
+
+def _expected_plugin_dir_is_valid(d: SafeDir) -> bool:
+    try:
+        raw = d.read_bounded("manifest.json", MANIFEST_CAP)
+        manifest = json.loads(raw.decode("utf-8"))
+    except (Unsafe, OSError, UnicodeDecodeError, ValueError):
+        return False
+    return isinstance(manifest, dict) and manifest.get("id") == PLUGIN_ID
+
+
+def _read_expected_plugin_asset(parts: tuple[str, ...], name: str, max_bytes: int) -> bytes:
+    """Read a regular, no-follow asset below the fixed validated checkout."""
+    d = _open_expected_plugin_dir()
+    opened: list[SafeDir] = []
+    try:
+        if not _expected_plugin_dir_is_valid(d):
+            raise Unsafe("expected plugin manifest is missing or foreign")
+        current = d
+        for part in parts:
+            child = current.enter(part)
+            opened.append(child)
+            current = child
+        return current.read_bounded(name, max_bytes)
+    finally:
+        for child in reversed(opened):
+            child.close()
+        d.close()
+
+
+def install_lifecycle_guard() -> None:
+    """Atomically install the independently executable lifecycle guard.
+
+    The source is read via a retained checkout/bin FD only after the fixed
+    checkout's manifest ID has been verified. The enabled systemd unit invokes
+    this installed copy, never a checkout pathname.
+    """
+    try:
+        source = _read_expected_plugin_asset(("bin",), GUARD_SOURCE_NAME, GUARD_SOURCE_CAP)
+    except (FileNotFoundError, OSError, Unsafe) as exc:
+        fail(f"cannot safely install lifecycle guard: {exc}")
+    if not source.startswith(b"#!"):
+        fail("refusing lifecycle guard without an interpreter header")
+    d = ensure_state_dir(rel_to_home(CONFIG_DIR))
+    try:
+        d.atomic_write(GUARD_INSTALLED_NAME, source, 0o700)
+    finally:
+        d.close()
+
+
+def _systemd_arg(value: str) -> str:
+    """Quote a fixed absolute argument for systemd's ExecStart parser."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 # =======================================================================
@@ -959,7 +1033,7 @@ def mount_dav(pid: int, rclone_bin: str) -> None:
 # systemd unit / GTK bookmark / Nautilus extension
 # =======================================================================
 
-def write_unit() -> None:
+def write_unit(*, enable: bool = True) -> None:
     d = ensure_state_dir(rel_to_home(UNIT_DIR))
     try:
         unit = f"""\
@@ -972,7 +1046,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart={SELF_PATH} serve
+ExecStart=/usr/bin/python3 -I {_systemd_arg(GUARD_INSTALLED)} serve
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
@@ -1007,13 +1081,46 @@ SyslogIdentifier={APP}
 [Install]
 WantedBy=default.target
 """
+        lifecycle_service = f"""\
+[Unit]
+Description=Fast Fruit Drive removal lifecycle check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I {_systemd_arg(GUARD_INSTALLED)} lifecycle-check
+Environment=PATH=/usr/bin
+UnsetEnvironment=BASH_ENV ENV PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONINSPECT LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT GIO_EXTRA_MODULES GI_TYPELIB_PATH GSETTINGS_BACKEND GIO_USE_VFS
+NoNewPrivileges=yes
+UMask=0077
+"""
+        lifecycle_path = f"""\
+[Unit]
+Description=Watch Fast Fruit Drive checkout removal
+
+[Path]
+PathChanged={PLUGIN_CHECKOUT}
+PathChanged={os.path.join(PLUGIN_CHECKOUT, "manifest.json")}
+Unit={LIFECYCLE_SERVICE_NAME}
+
+[Install]
+WantedBy=default.target
+"""
         d.atomic_write(UNIT_NAME, unit.encode("utf-8"), 0o644)
+        d.atomic_write(LIFECYCLE_SERVICE_NAME, lifecycle_service.encode("utf-8"), 0o644)
+        d.atomic_write(LIFECYCLE_PATH_NAME, lifecycle_path.encode("utf-8"), 0o644)
     finally:
         d.close()
     if not Tools.systemctl:
         fail("systemctl not found")
     run_bounded([Tools.systemctl, "--user", "daemon-reload"], timeout=10)
-    run_bounded([Tools.systemctl, "--user", "enable", UNIT_NAME], timeout=10)
+    if enable:
+        run_bounded([Tools.systemctl, "--user", "enable", UNIT_NAME], timeout=10)
+    # The watcher is the independent removal fallback. It is safe to enable
+    # during legacy migration even when the old main unit itself was disabled:
+    # its sole executable is the installed guard, and it removes itself after
+    # cleanup. Restart refreshes Path= directives after updates.
+    run_bounded([Tools.systemctl, "--user", "enable", LIFECYCLE_PATH_NAME], timeout=10)
+    run_bounded([Tools.systemctl, "--user", "restart", LIFECYCLE_PATH_NAME], timeout=10)
 
 
 def rewrite_bookmarks(append: "str | None") -> None:
@@ -1045,18 +1152,13 @@ def remove_bookmark() -> None:
 
 
 def install_nautilus_extension() -> None:
-    if not os.path.isfile(NAUTILUS_SOURCE):
-        return
+    # Read source relative to a validated fixed plugin checkout. A direct
+    # os.path.isfile/open() pair would re-resolve a mutable pathname after a
+    # check and could follow a substituted source link.
     try:
-        with open(NAUTILUS_SOURCE, "rb") as fh:
-            src_st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(src_st.st_mode) or src_st.st_size > 2_097_152:
-                fail("refusing to install oversized Nautilus extension source")
-            data = fh.read(2_097_153)
-            if len(data) > 2_097_152:
-                fail("refusing to install oversized Nautilus extension source")
-    except OSError as exc:
-        fail(f"cannot read Nautilus extension source: {exc}")
+        data = _read_expected_plugin_asset(("nautilus",), "fast_fruit_drive_nautilus.py", 2_097_152)
+    except (FileNotFoundError, OSError, Unsafe) as exc:
+        fail(f"cannot safely read Nautilus extension source: {exc}")
 
     d = ensure_state_dir(rel_to_home(EXTENSION_DIR))
     try:
@@ -1264,10 +1366,37 @@ def cmd_ensure(_args) -> None:
     # ProtectHome=read-only would otherwise leave a fresh install with no
     # way to create it from inside the sandboxed service.
     ensure_state_dir(rel_to_home(CACHE_DIR)).close()
+    install_lifecycle_guard()
     ensure_webdav_auth()
     write_unit()
     ensure_bookmark()
     install_nautilus_extension()
+
+
+def cmd_migrate_lifecycle(_args) -> None:
+    """Bootstrap the guard when an existing pre-0.2.1 unit is present.
+
+    The widget controller starts this private, non-persistent command as soon
+    as the updated plugin is loaded. It does not create or enable the main
+    service, bookmark, or extension for a plugin that has never been started.
+    If an old unit exists,
+    it atomically replaces only that registration so a subsequent restart (or
+    removal cleanup) cannot execute checkout content directly.
+    """
+    install_lifecycle_guard()
+    d = open_state_dir(rel_to_home(UNIT_DIR))
+    if d is None:
+        return
+    try:
+        try:
+            old = d.read_bounded(UNIT_NAME, 65_536, missing_ok=True)
+        except Unsafe as exc:
+            print(f"{APP}: refusing to migrate unsafe unit: {exc}", file=sys.stderr)
+            return
+    finally:
+        d.close()
+    if old is not None:
+        write_unit(enable=False)
 
 
 def cmd_serve(_args) -> None:
@@ -1485,17 +1614,19 @@ def cmd_uninstall(_args) -> None:
     was_running = _guard_no_dirty("uninstall")
     unmount_dav()
     if Tools.systemctl:
-        run_bounded([Tools.systemctl, "--user", "disable", "--now", UNIT_NAME], timeout=20)
+        run_bounded([Tools.systemctl, "--user", "disable", "--now", UNIT_NAME, LIFECYCLE_PATH_NAME], timeout=20)
     d = open_state_dir(rel_to_home(UNIT_DIR))
     if d is not None:
         try:
-            d.unlink(UNIT_NAME)
+            for name in (UNIT_NAME, LIFECYCLE_SERVICE_NAME, LIFECYCLE_PATH_NAME):
+                d.unlink(name)
         finally:
             d.close()
     d = open_state_dir(rel_to_home(WANTS_DIR))
     if d is not None:
         try:
-            d.unlink(UNIT_NAME)
+            for name in (UNIT_NAME, LIFECYCLE_PATH_NAME):
+                d.unlink(name)
         finally:
             d.close()
     if Tools.systemctl:
@@ -1637,6 +1768,7 @@ COMMANDS = {
     "configure": cmd_configure,
     "clear-cache": cmd_clear_cache,
     "uninstall": cmd_uninstall,
+    "__migrate-lifecycle": cmd_migrate_lifecycle,
     "help": cmd_help,
 }
 

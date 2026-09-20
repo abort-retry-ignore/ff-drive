@@ -23,7 +23,9 @@ In scope — this plugin defends against:
 - `clear-cache` or `uninstall` destroying a file that has not finished
   uploading to iCloud yet;
 - a crafted DAV URI making the Nautilus extension read or watch a path
-  outside its own cache directory.
+  outside its own cache directory;
+- marketplace removal leaving an enabled user service which later executes
+  arbitrary content placed at the deleted plugin checkout path.
 
 Out of scope:
 
@@ -43,6 +45,12 @@ real iCloud Drive through rclone, the same as any other Nautilus location.
 State this plugin writes, all under your own home directory:
 
 - `~/.config/systemd/user/fast-fruit-drive.service` — the user service unit
+  (its `ExecStart` invokes the independent guard, never the plugin checkout)
+- `~/.config/systemd/user/fast-fruit-drive-lifecycle.path` and
+  `fast-fruit-drive-lifecycle.service` — an enabled checkout-change watcher
+  and its on-demand guard invocation
+- `~/.config/fast-fruit-drive/lifecycle-guard` — a mode-700 copy of the
+  independently executable lifecycle guard
 - `~/.config/gtk-3.0/bookmarks` — one line, the **iCloud Drive** entry
 - `~/.local/share/nautilus-python/extensions/fast_fruit_drive_nautilus.py`
   — the emblem extension
@@ -112,6 +120,49 @@ non-group/world-writable files (root-owned symlinks are followed at most
 three hops, only within `/usr`), and the service's own `PATH` is closed to
 `/usr/bin`.
 
+### Marketplace removal lifecycle
+
+Omarchy has no declarative manifest uninstall hook, but its current removal
+flow deletes the checkout after disabling an enabled plugin. Fast Fruit Drive
+does not rely on a QML destruction callback for security: an enabled systemd
+path unit watches the fixed checkout and manifest path, so deletion or a
+foreign replacement invokes the guard even if QML is reloading or the plugin
+was already disabled. The bar widget still launches a delayed `lifecycle-check`
+on destruction so a plain disable can stop/disarm the drive while the checkout
+remains. The guard waits briefly, then distinguishes ordinary checkout updates,
+plain disable, and removal by checking the fixed checkout and fresh shell
+registry.
+
+The generated executable registrations run only:
+
+```text
+/usr/bin/python3 -I ~/.config/fast-fruit-drive/lifecycle-guard serve
+/usr/bin/python3 -I ~/.config/fast-fruit-drive/lifecycle-guard lifecycle-check
+```
+
+Before executing anything from the checkout, the guard derives the account
+home from `passwd(5)`, opens the exact fixed
+`~/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive` path
+component-by-component with `O_NOFOLLOW`, checks ownership/mode and the exact
+manifest ID, opens `bin/fast-fruit-drive` through that retained directory FD,
+and executes `/proc/self/fd/N` rather than reopening a checkout pathname.
+
+If the checkout is missing, symlinked, unsafe, or has another manifest ID, the
+guard executes none of its code. It disables the main user unit and lifecycle
+path unit first, schedules idempotent registration cleanup through a transient
+user service, then exits successfully so `Restart=on-failure` cannot retry a
+removed checkout. This is
+a fallback as well as removal protection: even if desktop lifecycle cleanup is
+interrupted, the next service invocation fails closed.
+
+Disable/removal cleanup stops/disables the unit, removes its unit file and
+wants link, unmounts the fixed DAV URI, removes only this plugin's GTK bookmark
+and Nautilus extension/bytecode. It deliberately does **not** delete
+configuration, including the now-inert guard, local WebDAV credentials, cache,
+or `rclone.conf`; preserving a possible `Dirty: true` cache is safer than
+losing an upload. The explicit `uninstall` command remains the only full state
+purge and retains its pending-upload refusal.
+
 ## Process isolation
 
 Every command the widget can trigger runs through a small supervisor
@@ -136,7 +187,7 @@ reports for that process, not a guessed process-group ID.
 
 ## Pending uploads are protected
 
-`clear-cache` and `uninstall` both delete the local on-demand cache.
+`clear-cache` and explicit full `uninstall` both delete the local on-demand cache.
 Before doing so, the service is stopped and rclone's own VFS metadata is
 scanned (bounded, descriptor-relative, same as everything else) for any
 entry marked `Dirty: true` — a write that has not finished uploading to

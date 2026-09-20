@@ -8,6 +8,9 @@ Item {
   id: root
 
   property var settings: ({})
+  // Panel.qml owns this controller. Its short migration command is idempotent
+  // and rewrites only a pre-0.2.1 unit that already exists; it never creates a
+  // drive service merely because the widget was loaded.
 
   property bool ready: false
   property bool running: false
@@ -44,6 +47,8 @@ Item {
   property string _appliedKey: ""
   property bool _statusOverflow: false
   property bool _controlOverflow: false
+  property bool _lifecycleMigrationLaunched: false
+  property bool _lifecycleCleanupLaunched: false
 
   // The helper's own __supervise command caps stdout/stderr at this many
   // raw bytes each *before* any line parsing happens (see run_bounded() in
@@ -122,8 +127,47 @@ Item {
   function helperFromUrl(url) {
     var value = String(url || "")
     if (value.indexOf("file://") === 0) value = value.substring(7)
-    return decodeURIComponent(value)
+    try { return decodeURIComponent(value) } catch (e) { return "" }
   }
+
+  // Derive the independent guard from this component's own helper URL, not
+  // inherited HOME/XDG. The guard still re-derives passwd(5) home and the
+  // fixed checkout before it acts. Removal is owned by the systemd path
+  // watcher; this is only the disable/reload classifier.
+  function lifecycleGuardPath() {
+    var suffix = "/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive/bin/fast-fruit-drive"
+    if (helperPath.length <= suffix.length || helperPath.slice(-suffix.length) !== suffix) return ""
+    var home = helperPath.slice(0, -suffix.length)
+    if (home === "" || home.charAt(0) !== "/" || home.indexOf("\u0000") !== -1) return ""
+    return home + "/.config/fast-fruit-drive/lifecycle-guard"
+  }
+
+  function migrateLifecycleGuard() {
+    if (_lifecycleMigrationLaunched || helperPath === "") return
+    _lifecycleMigrationLaunched = true
+    Quickshell.execDetached({
+      command: [pythonPath, "-I", helperPath, "__migrate-lifecycle"],
+      clearEnvironment: false,
+      environment: baseEnvironment,
+      unbindStdout: true
+    })
+  }
+
+  function checkRemovalLifecycle() {
+    if (_lifecycleCleanupLaunched) return
+    _lifecycleCleanupLaunched = true
+    var guard = lifecycleGuardPath()
+    if (guard === "") return
+    Quickshell.execDetached({
+      command: [pythonPath, "-I", guard, "lifecycle-check"],
+      clearEnvironment: false,
+      environment: baseEnvironment,
+      unbindStdout: true
+    })
+  }
+
+  Component.onCompleted: Qt.callLater(root.migrateLifecycleGuard)
+  Component.onDestruction: root.checkRemovalLifecycle()
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined

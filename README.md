@@ -24,9 +24,19 @@ bookmark named **iCloud Drive**.
 ## Remove
 
 ```sh
-~/.config/omarchy/plugins/io.github.abort-retry-ignore.ff-drive/bin/fast-fruit-drive uninstall
 omarchy plugin remove io.github.abort-retry-ignore.ff-drive
 ```
+
+Normal removal stops and disables the WebDAV service and removes the Nautilus
+bookmark and emblem extension automatically. It deliberately preserves the
+local cache and configuration: the cache may contain uploads that rclone has
+not finished sending yet. Reinstall or re-enable the plugin to resume them.
+Disabling the plugin does the same disarm while leaving the checkout in place.
+
+To fully purge Fast Fruit Drive state after pending uploads have completed,
+run its explicit `uninstall` command first, then remove the plugin. That
+command refuses to delete the cache while any upload is still pending.
+
 ## Requirements
 
 - [Omarchy](https://omarchy.org/) with third-party shell plugins
@@ -110,12 +120,17 @@ Config lives in `~/.config/fast-fruit-drive/config` and only ever contains
 `cache_max_size` and `cache_max_age_hours` — the only two settings this
 plugin exposes. Everything else (remote name, bind address, port, DAV
 host, display name, VFS mode) is a fixed constant, not something a config
-file can steer. Cache lives in `~/.cache/fast-fruit-drive`. The user
-systemd unit is `fast-fruit-drive.service`.
+file can steer. Cache lives in `~/.cache/fast-fruit-drive`. The user systemd unit is `fast-fruit-drive.service`. Its `ExecStart` runs a
+small independently installed guard at `~/.config/fast-fruit-drive/lifecycle-guard`,
+not a program in the marketplace checkout. A companion systemd path watcher
+also invokes that guard if the fixed plugin checkout changes or disappears.
+The guard verifies the fixed plugin path and manifest ID before it permits the
+checkout helper to run.
 
 Starting the drive (explicit toggle or `start`) writes only:
 
-- the user systemd unit
+- the user systemd unit, its independent lifecycle guard, and a systemd path
+  watcher for checkout removal
 - a GTK bookmark named **iCloud Drive**
 - a Nautilus Python extension copy
 - this plugin's config file, if missing
@@ -132,8 +147,10 @@ WebDAV authentication and the pending-upload guard on `clear-cache` and
 - Binds to `127.0.0.1` / `::1` only; the local WebDAV server requires a
   random per-install credential, verified against the systemd `MainPID`
   before GVFS ever receives it. Unauthenticated requests get HTTP 401.
-- `clear-cache` and `uninstall` refuse to run while any file has not
-  finished uploading, and restart the service so the upload can continue.
+- `clear-cache` and explicit full `uninstall` refuse to run while any file
+  has not finished uploading, and restart the service so the upload can
+  continue. Marketplace removal is different: it disarms integrations but
+  preserves cache/config so pending uploads are never deleted.
 - No rclone purge/delete flags; cache eviction is local only; does not
   overwrite `rclone.conf`; no sudo or pkexec.
 - One isolated Python process (`python3 -I`) does all the work; there is
@@ -145,6 +162,11 @@ WebDAV authentication and the pending-upload guard on `clear-cache` and
   raw output at 64 KiB per stream before any line parsing, enforces a
   wall-clock deadline, and group-kills and reaps the whole process tree on
   timeout or overflow.
+- Neither enabled systemd registration points at the marketplace checkout.
+  The main unit and checkout-change watcher invoke the independent guard,
+  which validates the exact fixed checkout path and manifest ID through
+  no-follow descriptors, pins the helper by FD before execution, and disables
+  all registrations if the checkout is missing or foreign.
 - The systemd unit is sandboxed: `ProtectSystem=strict`,
   `ProtectHome=read-only`, `NoNewPrivileges`, a stripped environment, an
   empty capability set, and more — see SECURITY.md for the full list.
@@ -153,6 +175,6 @@ WebDAV authentication and the pending-upload guard on `clear-cache` and
 
 ```sh
 omarchy plugin validate .
-qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Panel.qml Service.qml FruitIcon.qml
+qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Service.qml FruitIcon.qml
 python3 -m unittest discover -s tests -v
 ```

@@ -9,6 +9,7 @@ the real account home) and never touch systemd, rclone, or GVFS. Run with:
 from __future__ import annotations
 
 import contextlib
+import json
 import importlib.machinery
 import importlib.util
 import os
@@ -51,7 +52,7 @@ class SandboxedHome(unittest.TestCase):
             name: getattr(ffd, name)
             for name in (
                 "HOME", "CONFIG_DIR", "CACHE_DIR", "UNIT_DIR", "WANTS_DIR",
-                "BOOKMARKS_DIR", "RCLONE_CONF_DIR", "EXTENSION_DIR",
+                "BOOKMARKS_DIR", "RCLONE_CONF_DIR", "EXTENSION_DIR", "PLUGIN_CHECKOUT", "GUARD_INSTALLED",
                 "_EXTRA_TRUSTED_UIDS",
             )
         }
@@ -63,6 +64,8 @@ class SandboxedHome(unittest.TestCase):
         ffd.BOOKMARKS_DIR = os.path.join(home, ".config", "gtk-3.0")
         ffd.RCLONE_CONF_DIR = os.path.join(home, ".config", "rclone")
         ffd.EXTENSION_DIR = os.path.join(home, ".local", "share", "nautilus-python", "extensions")
+        ffd.PLUGIN_CHECKOUT = os.path.join(home, ffd.PLUGIN_REL)
+        ffd.GUARD_INSTALLED = os.path.join(ffd.CONFIG_DIR, ffd.GUARD_INSTALLED_NAME)
 
     def tearDown(self):
         for name, value in self._orig.items():
@@ -157,6 +160,74 @@ class SafeDirTests(SandboxedHome):
                 home.remove_tree(ffd.rel_to_home(ffd.CACHE_DIR), max_entries=2)
         finally:
             home.close()
+
+
+class GuardInstallTests(SandboxedHome):
+    def _write_expected_plugin(self, plugin_id=None):
+        plugin = os.path.join(ffd.HOME, ".config", "omarchy", "plugins", ffd.PLUGIN_ID)
+        os.makedirs(os.path.join(plugin, "bin"), mode=0o700)
+        with open(os.path.join(plugin, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump({"id": plugin_id or ffd.PLUGIN_ID}, fh)
+        with open(os.path.join(ROOT, "bin", ffd.GUARD_SOURCE_NAME), "rb") as src:
+            data = src.read()
+        with open(os.path.join(plugin, "bin", ffd.GUARD_SOURCE_NAME), "wb") as dst:
+            dst.write(data)
+        os.chmod(os.path.join(plugin, "bin", ffd.GUARD_SOURCE_NAME), 0o700)
+
+    def test_installs_guard_only_from_expected_manifest(self):
+        self._write_expected_plugin()
+        ffd.install_lifecycle_guard()
+        with open(ffd.GUARD_INSTALLED, "rb") as fh:
+            installed = fh.read()
+        with open(os.path.join(ROOT, "bin", ffd.GUARD_SOURCE_NAME), "rb") as fh:
+            self.assertEqual(installed, fh.read())
+        self.assertEqual(stat.S_IMODE(os.stat(ffd.GUARD_INSTALLED).st_mode), 0o700)
+
+    def test_refuses_guard_from_foreign_checkout(self):
+        self._write_expected_plugin("example.foreign")
+        with self.assertRaises(SystemExit):
+            ffd.install_lifecycle_guard()
+        self.assertFalse(os.path.exists(ffd.GUARD_INSTALLED))
+
+    def test_unit_execstart_references_installed_guard_not_checkout(self):
+        old_systemctl, old_run = ffd.Tools.systemctl, ffd.run_bounded
+        ffd.Tools.systemctl = "/usr/bin/systemctl"
+        ffd.run_bounded = lambda *_args, **_kwargs: ffd.BoundedResult(0, b"", b"")
+        try:
+            ffd.write_unit()
+        finally:
+            ffd.Tools.systemctl, ffd.run_bounded = old_systemctl, old_run
+        with open(os.path.join(ffd.UNIT_DIR, ffd.UNIT_NAME), encoding="utf-8") as fh:
+            unit = fh.read()
+        self.assertIn(f'ExecStart=/usr/bin/python3 -I "{ffd.GUARD_INSTALLED}" serve', unit)
+        self.assertNotIn(".config/omarchy/plugins/", unit)
+        with open(os.path.join(ffd.UNIT_DIR, ffd.LIFECYCLE_SERVICE_NAME), encoding="utf-8") as fh:
+            lifecycle_service = fh.read()
+        self.assertIn(f'ExecStart=/usr/bin/python3 -I "{ffd.GUARD_INSTALLED}" lifecycle-check', lifecycle_service)
+        self.assertNotIn(".config/omarchy/plugins/", lifecycle_service)
+        with open(os.path.join(ffd.UNIT_DIR, ffd.LIFECYCLE_PATH_NAME), encoding="utf-8") as fh:
+            self.assertIn(ffd.PLUGIN_CHECKOUT, fh.read())
+
+    def test_lifecycle_migration_rewrites_only_an_existing_unit(self):
+        self._write_expected_plugin()
+        os.makedirs(ffd.UNIT_DIR, mode=0o700)
+        old_unit = os.path.join(ffd.UNIT_DIR, ffd.UNIT_NAME)
+        with open(old_unit, "w", encoding="utf-8") as fh:
+            fh.write("[Service]\nExecStart=/old/checkout/bin/fast-fruit-drive serve\n")
+        commands = []
+        old_systemctl, old_run = ffd.Tools.systemctl, ffd.run_bounded
+        ffd.Tools.systemctl = "/usr/bin/systemctl"
+        ffd.run_bounded = lambda argv, **_kwargs: commands.append(argv) or ffd.BoundedResult(0, b"", b"")
+        try:
+            ffd.cmd_migrate_lifecycle([])
+        finally:
+            ffd.Tools.systemctl, ffd.run_bounded = old_systemctl, old_run
+        with open(old_unit, encoding="utf-8") as fh:
+            self.assertIn(f'ExecStart=/usr/bin/python3 -I "{ffd.GUARD_INSTALLED}" serve', fh.read())
+        self.assertTrue(os.path.exists(ffd.GUARD_INSTALLED))
+        self.assertTrue(any(command[-1:] == ["daemon-reload"] for command in commands))
+        self.assertFalse(any(command[-2:] == ["enable", ffd.UNIT_NAME] for command in commands))
+        self.assertTrue(any(command[-2:] == ["enable", ffd.LIFECYCLE_PATH_NAME] for command in commands))
 
 
 class ConfigTests(SandboxedHome):
