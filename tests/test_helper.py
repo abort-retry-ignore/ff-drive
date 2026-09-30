@@ -389,6 +389,16 @@ class VerifiedExecTests(unittest.TestCase):
         self.assertTrue(resolved.startswith("/usr/"))
 
 
+class MountCommandTests(unittest.TestCase):
+    def test_mount_is_public_and_supervisable(self):
+        self.assertIn("mount", ffd.PUBLIC_COMMANDS)
+        self.assertIn("mount", ffd.SUPERVISABLE_COMMANDS)
+        self.assertIn("mount", ffd.COMMANDS)
+
+    def test_usage_lists_mount(self):
+        self.assertIn("mount", ffd.USAGE)
+
+
 class SuperviseGuardTests(unittest.TestCase):
     def test_serve_and_login_tui_are_not_supervisable(self):
         self.assertNotIn("serve", ffd.SUPERVISABLE_COMMANDS)

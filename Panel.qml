@@ -109,6 +109,7 @@ Panel {
     function start(): string { drive.start(); return "ok" }
     function stop(): string { drive.stop(); return "ok" }
     function files(): string { drive.openDrive(); return "ok" }
+    function mount(): string { drive.mountDrive(); return "ok" }
     function login(): string { drive.login(); return "ok" }
     function clearcache(): string { drive.clearCache(); return "ok" }
     function status(): string { return drive.statusText }

@@ -223,6 +223,14 @@ class LifecycleQmlTests(unittest.TestCase):
         self.assertIn('"-I", guard, "lifecycle-check"', qml)
         self.assertNotIn("rm -rf", qml)
 
+    def test_widget_remounts_running_server_without_mount(self):
+        with open(os.path.join(ROOT, "Service.qml"), encoding="utf-8") as fh:
+            qml = fh.read()
+        self.assertIn('runControl(["mount"])', qml)
+        self.assertIn("mountDrive", qml)
+        # Retries must be bounded, not a busy loop while the mount fails.
+        self.assertIn("_mountTries < 3", qml)
+
 
 if __name__ == "__main__":
     unittest.main()

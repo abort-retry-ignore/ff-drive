@@ -92,7 +92,7 @@ PLUGIN_DIR = os.path.dirname(HERE)
 NAUTILUS_SOURCE = os.path.join(PLUGIN_DIR, "nautilus", "fast_fruit_drive_nautilus.py")
 
 PUBLIC_COMMANDS = (
-    "status", "start", "stop", "restart", "toggle", "open",
+    "status", "start", "stop", "restart", "toggle", "open", "mount",
     "login", "login-tui", "serve", "ensure", "configure",
     "clear-cache", "uninstall", "help",
 )
@@ -1516,6 +1516,23 @@ def cmd_open(_args) -> None:
     ensure_bookmark()
 
 
+def cmd_mount(_args) -> None:
+    """Re-establish the GVFS mount behind the Nautilus sidebar bookmark.
+
+    GVFS mounts die with the desktop session, so right after a reboot the
+    server is up but nothing has mounted it yet: a direct sidebar click
+    would otherwise hit the authenticated 401 and show a password prompt
+    for a credential the user is never meant to see. The widget calls this
+    when it observes running && !mounted. Mounting never starts the server:
+    only `start`/`toggle`/`open` may do that.
+    """
+    if not service_running():
+        fail("Fast Fruit Drive is not running \u2014 toggle it on from the bar")
+    wait_for_server()
+    do_mount()
+    ensure_bookmark()
+
+
 def cmd_login(_args) -> None:
     if Tools.omarchy:
         spawn_detached([Tools.omarchy, "launch", "tui",
@@ -1707,6 +1724,8 @@ Commands:
   restart                        Restart the user service
   toggle                         Start if stopped, stop if running
   open                           Start if needed and open in Nautilus
+  mount                          Re-mount the running server for the
+                                  Nautilus sidebar (never starts the server)
   login                          Open a terminal for iCloud sign-in / reconnect
   login-tui                      Interactive rclone reconnect (run inside a terminal)
   serve                          Exec rclone (systemd ExecStart)
@@ -1761,6 +1780,7 @@ COMMANDS = {
     "restart": cmd_restart,
     "toggle": cmd_toggle,
     "open": cmd_open,
+    "mount": cmd_mount,
     "login": cmd_login,
     "login-tui": cmd_login_tui,
     "serve": cmd_serve,

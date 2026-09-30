@@ -78,6 +78,8 @@ cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
 - Left click: panel
 - Right click: refresh
 - Middle click: open in Nautilus
+- After a reboot the widget re-mounts the drive within one refresh cycle, so
+  the Nautilus **iCloud Drive** bookmark opens with no password prompt
 - In the panel: toggle the server, open Nautilus, sign in
 - Keys: `r` refresh, `o` open, `i` sign in, `p` / Enter on the switch to toggle
 
@@ -112,6 +114,7 @@ fast-fruit-drive start
 fast-fruit-drive stop
 fast-fruit-drive toggle
 fast-fruit-drive open
+fast-fruit-drive mount
 fast-fruit-drive uninstall
 fast-fruit-drive configure cache_max_size=4G cache_max_age_hours=24
 ```

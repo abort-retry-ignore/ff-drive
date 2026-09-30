@@ -49,6 +49,9 @@ Item {
   property bool _controlOverflow: false
   property bool _lifecycleMigrationLaunched: false
   property bool _lifecycleCleanupLaunched: false
+  // Bounded auto-remount attempts after a reboot (GVFS mounts do not
+  // survive the session; see cmd_mount()). Reset when a mount exists.
+  property int _mountTries: 0
 
   // The helper's own __supervise command caps stdout/stderr at this many
   // raw bytes each *before* any line parsing happens (see run_bounded() in
@@ -215,6 +218,17 @@ Item {
     cacheUsedBytes = Number(parsed.cacheUsedBytes || 0)
     lastError = String(parsed.lastError || "")
     if (_desired !== -1 && running === (_desired === 1)) _desired = -1
+    // After a reboot the running server has no GVFS mount until something
+    // mounts it with the local credential; remount from here so the
+    // sidebar bookmark opens without a password prompt. The helper only
+    // sends that credential after verifying the listener belongs to the
+    // sandboxed service. Bounded retries cover GVFS not being ready yet
+    // when the shell loads; a successful mount resets the counter.
+    if (root.mounted) root._mountTries = 0
+    else if (root.running && !root.busy && root._mountTries < 3) {
+      root._mountTries += 1
+      root.mountDrive()
+    }
   }
 
   function elideStatus(text) {
@@ -236,6 +250,7 @@ Item {
   function stop() { runControl(["stop"], 0) }
   function toggleRunning() { active ? stop() : start() }
   function openDrive() { runControl(["open"]) }
+  function mountDrive() { runControl(["mount"]) }
   function login() { runControl(["login"]) }
   function clearCache() { runControl(["clear-cache"]) }
 
