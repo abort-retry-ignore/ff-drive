@@ -1,3 +1,4 @@
+# Managed-By: io.github.abort-retry-ignore.ff-drive
 """
 Fast Fruit Drive — Nautilus emblems for iCloud WebDAV cache/upload state.
 

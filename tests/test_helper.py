@@ -21,6 +21,8 @@ import time
 import unittest
 from unittest import mock
 
+import registration_fixtures as fx
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HELPER_PATH = os.path.join(ROOT, "bin", "fast-fruit-drive")
 
@@ -214,7 +216,8 @@ class GuardInstallTests(SandboxedHome):
         os.makedirs(ffd.UNIT_DIR, mode=0o700)
         old_unit = os.path.join(ffd.UNIT_DIR, ffd.UNIT_NAME)
         with open(old_unit, "w", encoding="utf-8") as fh:
-            fh.write("[Service]\nExecStart=/old/checkout/bin/fast-fruit-drive serve\n")
+            # A real 0.2.0 unit: it ran the checkout helper directly.
+            fh.write(fx.legacy_020_units("/old/checkout/bin/fast-fruit-drive")[fx.SERVICE])
         commands = []
         old_systemctl, old_run = ffd.Tools.systemctl, ffd.run_bounded
         ffd.Tools.systemctl = "/usr/bin/systemctl"

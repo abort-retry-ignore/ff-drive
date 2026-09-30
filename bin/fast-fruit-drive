@@ -54,6 +54,13 @@ LIFECYCLE_PATH_NAME = "fast-fruit-drive-lifecycle.path"
 GUARD_SOURCE_NAME = "fast-fruit-drive-guard.py"
 GUARD_INSTALLED_NAME = "lifecycle-guard"
 GUARD_SOURCE_CAP = 262_144
+EXTENSION_NAME = "fast_fruit_drive_nautilus.py"
+EXTENSION_CAP = 2_097_152
+UNIT_CAP = 65_536
+# First line of every systemd unit and of the Nautilus extension this plugin
+# installs into a shared, user-wide directory. It names the plugin ID, so a
+# file with the same name from anything else is recognisably not ours.
+OWNER_MARKER = f"# Managed-By: {PLUGIN_ID}"
 MANIFEST_CAP = 65_536
 
 # ---------------------------------------------------------------------
@@ -278,7 +285,9 @@ class SafeDir:
         if not _valid_component(name):
             raise Unsafe(f"unsafe filename: {name!r}")
         try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+            # O_NONBLOCK: a planted FIFO at a fixed registration name must
+            # fail the regular-file check below instead of blocking the open.
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         except FileNotFoundError:
             if missing_ok:
                 return None
@@ -307,6 +316,22 @@ class SafeDir:
             os.unlink(name, dir_fd=self.fd)
         except FileNotFoundError:
             pass
+
+    def unlink_symlink_to(self, name: str, targets) -> bool:
+        """Unlink ``name`` only if it is a symlink whose target is one of
+        ``targets`` verbatim. Anything else (a regular file, a link that
+        points elsewhere, a missing entry) is left untouched."""
+        try:
+            target = os.readlink(name, dir_fd=self.fd)
+        except OSError:  # missing, or not a symlink (EINVAL)
+            return False
+        if target not in targets:
+            return False
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            return False
+        return True
 
     def remove_tree(self, name: str, *, max_entries: int = 200_000, max_depth: int = 64) -> None:
         try:
@@ -1033,10 +1058,143 @@ def mount_dav(pid: int, rclone_bin: str) -> None:
 # systemd unit / GTK bookmark / Nautilus extension
 # =======================================================================
 
+# -----------------------------------------------------------------------
+# Registration ownership
+#
+# The units and the Nautilus extension live at fixed names inside directories
+# shared with everything else the user runs. This plugin therefore only ever
+# overwrites, disables, stops or deletes a registration it can positively
+# identify as its own:
+#
+#   * files it writes start with OWNER_MARKER (naming the plugin ID) and are
+#     bound to this installation: units must run the guard copy under this
+#     account's config dir / watch this account's plugin checkout;
+#   * registrations written by earlier releases carry no marker, so they are
+#     recognised by their exact generated shape (Description= plus an
+#     ExecStart=/Unit= line pointing at us). They are migrated by the first
+#     write, which adds the marker.
+#
+# Anything else at those names -- a different file, a symlink, a FIFO, a file
+# owned by someone else, or oversized data -- is foreign: install refuses and
+# leaves it byte-for-byte alone, and removal skips it (and never touches the
+# systemd state of a unit it did not write).
+#
+# bin/fast-fruit-drive-guard.py carries an independent copy of this logic
+# because it must keep working after this checkout is gone; the tests assert
+# both implementations classify the same fixtures identically.
+# -----------------------------------------------------------------------
+
+UNIT_FILES = (UNIT_NAME, LIFECYCLE_SERVICE_NAME, LIFECYCLE_PATH_NAME)
+# Units with an [Install] section (the oneshot lifecycle service has none).
+ENABLED_UNITS = (UNIT_NAME, LIFECYCLE_PATH_NAME)
+_UNIT_DESCRIPTIONS = {
+    UNIT_NAME: "Fast Fruit Drive \u2014 rclone iCloud WebDAV for Nautilus",
+    LIFECYCLE_SERVICE_NAME: "Fast Fruit Drive removal lifecycle check",
+    LIFECYCLE_PATH_NAME: "Watch Fast Fruit Drive checkout removal",
+}
+_LEGACY_EXTENSION_HEADER = (
+    '"""\nFast Fruit Drive \u2014 Nautilus emblems for iCloud WebDAV cache/upload state.\n'
+).encode("utf-8")
+
+
+def _unit_bound_to_install(name: str, lines: "list[str]", *, legacy: bool) -> bool:
+    guard = _systemd_arg(GUARD_INSTALLED)
+    if name == UNIT_NAME:
+        if f"ExecStart=/usr/bin/python3 -I {guard} serve" in lines:
+            return True
+        # 0.2.0 and earlier ran the checkout helper directly.
+        return legacy and f"SyslogIdentifier={APP}" in lines and any(
+            line.startswith("ExecStart=/") and line.endswith(f"/{APP} serve") for line in lines
+        )
+    if name == LIFECYCLE_SERVICE_NAME:
+        return f"ExecStart=/usr/bin/python3 -I {guard} lifecycle-check" in lines
+    if name == LIFECYCLE_PATH_NAME:
+        return f"Unit={LIFECYCLE_SERVICE_NAME}" in lines and f"PathChanged={PLUGIN_CHECKOUT}" in lines
+    return False
+
+
+def unit_is_ours(name: str, data: bytes) -> bool:
+    """Whether ``data`` is a unit this installation of the plugin wrote."""
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return False
+    description = _UNIT_DESCRIPTIONS.get(name)
+    if description is None or f"Description={description}" not in lines:
+        return False
+    marked = bool(lines) and lines[0].startswith("# Managed-By:")
+    if marked and lines[0] != OWNER_MARKER:
+        return False  # explicitly claimed by something else
+    return _unit_bound_to_install(name, lines, legacy=not marked)
+
+
+def extension_is_ours(data: bytes) -> bool:
+    """Whether ``data`` is a Nautilus extension this plugin shipped."""
+    return data.startswith(OWNER_MARKER.encode("utf-8") + b"\n") or data.startswith(_LEGACY_EXTENSION_HEADER)
+
+
+def inspect_registration(d: SafeDir, name: str, cap: int, is_ours) -> "tuple[str, bytes | None]":
+    """Classify ``name`` under the pinned directory ``d``.
+
+    Returns ``("missing"|"ours"|"foreign", data)``. Every way the entry can
+    fail to be a plain, trusted, bounded regular file (symlink, FIFO, wrong
+    owner, group/world-writable, oversized, unreadable) is "foreign": fail
+    closed, never follow.
+    """
+    try:
+        data = d.read_bounded(name, cap, missing_ok=True)
+    except (Unsafe, OSError):
+        return "foreign", None
+    if data is None:
+        return "missing", None
+    return ("ours" if is_ours(data) else "foreign"), data
+
+
+def _unit_predicate(name: str):
+    return lambda data: unit_is_ours(name, data)
+
+
+def _refuse_foreign(path: str) -> "None":
+    fail(
+        f"refusing to overwrite {path}: it was not installed by Fast Fruit Drive ({PLUGIN_ID}). "
+        "Move it aside, then toggle Fast Fruit Drive on again."
+    )
+
+
+def check_registration_ownership() -> None:
+    """Fail before anything is written if a fixed-name registration is foreign.
+
+    ``write_unit`` and ``install_nautilus_extension`` repeat the check against
+    their own pinned directory descriptor immediately before writing; this
+    early pass just keeps a refused install from leaving partial state.
+    """
+    d = open_state_dir(rel_to_home(UNIT_DIR))
+    if d is not None:
+        try:
+            for name in UNIT_FILES:
+                if inspect_registration(d, name, UNIT_CAP, _unit_predicate(name))[0] == "foreign":
+                    _refuse_foreign(os.path.join(UNIT_DIR, name))
+        finally:
+            d.close()
+    d = open_state_dir(rel_to_home(EXTENSION_DIR))
+    if d is not None:
+        try:
+            if inspect_registration(d, EXTENSION_NAME, EXTENSION_CAP, extension_is_ours)[0] == "foreign":
+                _refuse_foreign(os.path.join(EXTENSION_DIR, EXTENSION_NAME))
+        finally:
+            d.close()
+
+
 def write_unit(*, enable: bool = True) -> None:
     d = ensure_state_dir(rel_to_home(UNIT_DIR))
     try:
+        # Check all three before writing any, so a refusal never leaves a
+        # half-replaced set of units behind.
+        for name in UNIT_FILES:
+            if inspect_registration(d, name, UNIT_CAP, _unit_predicate(name))[0] == "foreign":
+                _refuse_foreign(os.path.join(UNIT_DIR, name))
         unit = f"""\
+{OWNER_MARKER}
 [Unit]
 Description=Fast Fruit Drive \u2014 rclone iCloud WebDAV for Nautilus
 After=network-online.target
@@ -1082,6 +1240,7 @@ SyslogIdentifier={APP}
 WantedBy=default.target
 """
         lifecycle_service = f"""\
+{OWNER_MARKER}
 [Unit]
 Description=Fast Fruit Drive removal lifecycle check
 
@@ -1094,6 +1253,7 @@ NoNewPrivileges=yes
 UMask=0077
 """
         lifecycle_path = f"""\
+{OWNER_MARKER}
 [Unit]
 Description=Watch Fast Fruit Drive checkout removal
 
@@ -1123,18 +1283,27 @@ WantedBy=default.target
     run_bounded([Tools.systemctl, "--user", "restart", LIFECYCLE_PATH_NAME], timeout=10)
 
 
+def _bookmark_is_ours(line: str) -> bool:
+    """Exact-URI test for this plugin's own GTK bookmark line.
+
+    The current URI is unique to this plugin (user ff-drive at
+    iCloud.localhost). The generic loopback URIs earlier releases used could
+    just as well be someone else's WebDAV server, so those only count when the
+    label is one this plugin wrote. A label alone never identifies a bookmark.
+    """
+    uri, _, label = line.partition(" ")
+    if uri == DAV_URI:
+        return True
+    legacy = (LEGACY_URI_NO_USER, LEGACY_URI_OLD_HOST_AUTH, LEGACY_URI_OLD_HOST)
+    return uri in legacy and label.strip() in (DISPLAY_NAME, "iCloud WebDAV")
+
+
 def rewrite_bookmarks(append: "str | None") -> None:
     d = ensure_state_dir(rel_to_home(BOOKMARKS_DIR))
     try:
         existing = d.read_bounded("bookmarks", 1_048_576, missing_ok=True)
         lines = existing.decode("utf-8", "replace").splitlines() if existing else []
-        drop_prefixes = (DAV_URI, LEGACY_URI_NO_USER, LEGACY_URI_OLD_HOST_AUTH, LEGACY_URI_OLD_HOST)
-        keep = [
-            line for line in lines
-            if not (line.startswith("dav://") and (
-                "iCloud Drive" in line or "iCloud WebDAV" in line
-                or line.startswith(drop_prefixes)))
-        ]
+        keep = [line for line in lines if not _bookmark_is_ours(line)]
         if append:
             keep.append(append)
         data = ("\n".join(keep) + "\n").encode("utf-8", "replace") if keep else b""
@@ -1156,16 +1325,21 @@ def install_nautilus_extension() -> None:
     # os.path.isfile/open() pair would re-resolve a mutable pathname after a
     # check and could follow a substituted source link.
     try:
-        data = _read_expected_plugin_asset(("nautilus",), "fast_fruit_drive_nautilus.py", 2_097_152)
+        data = _read_expected_plugin_asset(("nautilus",), EXTENSION_NAME, EXTENSION_CAP)
     except (FileNotFoundError, OSError, Unsafe) as exc:
         fail(f"cannot safely read Nautilus extension source: {exc}")
+    if not data.startswith(OWNER_MARKER.encode("utf-8") + b"\n"):
+        # Never install a file we could not later recognise as ours.
+        fail("refusing Nautilus extension source without its ownership marker")
 
     d = ensure_state_dir(rel_to_home(EXTENSION_DIR))
     try:
-        existing = d.read_bounded("fast_fruit_drive_nautilus.py", 2_097_152, missing_ok=True)
+        state, existing = inspect_registration(d, EXTENSION_NAME, EXTENSION_CAP, extension_is_ours)
+        if state == "foreign":
+            _refuse_foreign(os.path.join(EXTENSION_DIR, EXTENSION_NAME))
         if existing == data:
             return
-        d.atomic_write("fast_fruit_drive_nautilus.py", data, 0o644)
+        d.atomic_write(EXTENSION_NAME, data, 0o644)
     finally:
         d.close()
 
@@ -1175,7 +1349,15 @@ def remove_nautilus_extension() -> None:
     if d is None:
         return
     try:
-        d.unlink("fast_fruit_drive_nautilus.py")
+        state, _ = inspect_registration(d, EXTENSION_NAME, EXTENSION_CAP, extension_is_ours)
+        if state == "foreign":
+            print(
+                f"{APP}: leaving {os.path.join(EXTENSION_DIR, EXTENSION_NAME)} in place: "
+                "it was not installed by Fast Fruit Drive",
+                file=sys.stderr,
+            )
+            return
+        d.unlink(EXTENSION_NAME)
         try:
             pycache = d.enter("__pycache__")
         except (FileNotFoundError, Unsafe):
@@ -1285,8 +1467,24 @@ def cache_bytes() -> int:
 # systemctl / gio helpers
 # =======================================================================
 
+def service_unit_owned() -> bool:
+    """Whether the user-level service unit at UNIT_NAME is one we wrote.
+
+    Runtime control (status, start, stop, restart) is only meaningful for our
+    own unit. A same-named unit from anything else is never queried as if it
+    were ours and never stopped or restarted on our behalf.
+    """
+    d = open_state_dir(rel_to_home(UNIT_DIR))
+    if d is None:
+        return False
+    try:
+        return inspect_registration(d, UNIT_NAME, UNIT_CAP, _unit_predicate(UNIT_NAME))[0] == "ours"
+    finally:
+        d.close()
+
+
 def service_main_pid() -> "int | None":
-    if not Tools.systemctl:
+    if not Tools.systemctl or not service_unit_owned():
         return None
     result = run_bounded([Tools.systemctl, "--user", "show", "-p", "MainPID", "--value", UNIT_NAME], timeout=5)
     if not result.ok:
@@ -1299,15 +1497,22 @@ def service_main_pid() -> "int | None":
 
 
 def service_running() -> bool:
-    if not Tools.systemctl:
+    if not Tools.systemctl or not service_unit_owned():
         return False
     result = run_bounded([Tools.systemctl, "--user", "is-active", "--quiet", UNIT_NAME], timeout=5)
     return result.returncode == 0 and not result.timed_out
 
 
+_MUTATING_VERBS = frozenset({"start", "stop", "restart", "reload", "try-restart", "kill"})
+
+
 def systemctl(*args: str, timeout: float = 20) -> BoundedResult:
     if not Tools.systemctl:
         fail("systemctl not found")
+    if args and args[0] in _MUTATING_VERBS and UNIT_NAME in args and not service_unit_owned():
+        note = f"not touching {UNIT_NAME}: the user unit of that name was not installed by Fast Fruit Drive"
+        print(f"{APP}: {note}", file=sys.stderr)
+        return BoundedResult(1, b"", note.encode("utf-8"))
     return run_bounded([Tools.systemctl, "--user", *args], timeout=timeout)
 
 
@@ -1359,6 +1564,9 @@ def require_packages() -> None:
 
 def cmd_ensure(_args) -> None:
     require_packages()
+    # Refuse up front, before any state is written, if a fixed-name unit or
+    # extension belongs to something else.
+    check_registration_ownership()
     cfg = load_config()
     save_config(cfg)
     # ReadWritePaths= in the unit below needs this directory to already
@@ -1388,14 +1596,17 @@ def cmd_migrate_lifecycle(_args) -> None:
     if d is None:
         return
     try:
-        try:
-            old = d.read_bounded(UNIT_NAME, 65_536, missing_ok=True)
-        except Unsafe as exc:
-            print(f"{APP}: refusing to migrate unsafe unit: {exc}", file=sys.stderr)
-            return
+        state, _ = inspect_registration(d, UNIT_NAME, UNIT_CAP, _unit_predicate(UNIT_NAME))
     finally:
         d.close()
-    if old is not None:
+    if state == "foreign":
+        print(
+            f"{APP}: not migrating {os.path.join(UNIT_DIR, UNIT_NAME)}: "
+            "it was not installed by Fast Fruit Drive",
+            file=sys.stderr,
+        )
+        return
+    if state == "ours":
         write_unit(enable=False)
 
 
@@ -1627,28 +1838,56 @@ def _format_bytes(n: int) -> str:
     return f"{value:.1f}TB"
 
 
+def remove_unit_registrations() -> None:
+    """Disable, stop and delete only the units this installation wrote.
+
+    Foreign files at the same names are reported and left alone, and their
+    systemd state (enabled, active, failed) is never touched.
+    """
+    d = open_state_dir(rel_to_home(UNIT_DIR))
+    if d is None:
+        return
+    try:
+        owned = []
+        for name in UNIT_FILES:
+            state, _ = inspect_registration(d, name, UNIT_CAP, _unit_predicate(name))
+            if state == "ours":
+                owned.append(name)
+            elif state == "foreign":
+                print(
+                    f"{APP}: leaving {os.path.join(UNIT_DIR, name)} in place: "
+                    "it was not installed by Fast Fruit Drive",
+                    file=sys.stderr,
+                )
+        if not owned:
+            return
+        enabled = [name for name in ENABLED_UNITS if name in owned]
+        if Tools.systemctl and enabled:
+            run_bounded([Tools.systemctl, "--user", "disable", "--now", *enabled], timeout=20)
+        for name in owned:
+            # Re-check through the same pinned descriptor right before deleting.
+            if inspect_registration(d, name, UNIT_CAP, _unit_predicate(name))[0] == "ours":
+                d.unlink(name)
+    finally:
+        d.close()
+    wants = open_state_dir(rel_to_home(WANTS_DIR))
+    if wants is not None:
+        try:
+            for name in enabled:
+                # Only the enablement symlink pointing at our unit file.
+                wants.unlink_symlink_to(name, {os.path.join(UNIT_DIR, name), "../" + name})
+        finally:
+            wants.close()
+    if Tools.systemctl:
+        if UNIT_NAME in owned:
+            run_bounded([Tools.systemctl, "--user", "reset-failed", UNIT_NAME], timeout=10)
+        run_bounded([Tools.systemctl, "--user", "daemon-reload"], timeout=10)
+
+
 def cmd_uninstall(_args) -> None:
     was_running = _guard_no_dirty("uninstall")
     unmount_dav()
-    if Tools.systemctl:
-        run_bounded([Tools.systemctl, "--user", "disable", "--now", UNIT_NAME, LIFECYCLE_PATH_NAME], timeout=20)
-    d = open_state_dir(rel_to_home(UNIT_DIR))
-    if d is not None:
-        try:
-            for name in (UNIT_NAME, LIFECYCLE_SERVICE_NAME, LIFECYCLE_PATH_NAME):
-                d.unlink(name)
-        finally:
-            d.close()
-    d = open_state_dir(rel_to_home(WANTS_DIR))
-    if d is not None:
-        try:
-            for name in (UNIT_NAME, LIFECYCLE_PATH_NAME):
-                d.unlink(name)
-        finally:
-            d.close()
-    if Tools.systemctl:
-        run_bounded([Tools.systemctl, "--user", "reset-failed", UNIT_NAME], timeout=10)
-        run_bounded([Tools.systemctl, "--user", "daemon-reload"], timeout=10)
+    remove_unit_registrations()
     remove_bookmark()
     remove_nautilus_extension()
     home = open_home()

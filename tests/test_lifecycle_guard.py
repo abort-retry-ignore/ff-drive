@@ -15,6 +15,8 @@ import stat
 import tempfile
 import unittest
 
+import registration_fixtures as fx
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD_PATH = os.path.join(ROOT, "bin", "fast-fruit-drive-guard.py")
 
@@ -166,16 +168,19 @@ class CleanupTests(SandboxedGuardHome):
         os.makedirs(os.path.join(self.home, ".local", "share", "nautilus-python", "extensions", "__pycache__"), mode=0o700)
         os.makedirs(os.path.join(self.home, ".config", "fast-fruit-drive"), mode=0o700)
         os.makedirs(os.path.join(self.home, ".cache", "fast-fruit-drive"), mode=0o700)
+        unit_dir = os.path.join(self.home, ".config", "systemd", "user")
+        units = fx.current_units(guard.guard_path(), guard.plugin_checkout())
         for name in (guard.UNIT_NAME, guard.LIFECYCLE_SERVICE_NAME, guard.LIFECYCLE_PATH_NAME):
-            with open(os.path.join(self.home, ".config", "systemd", "user", name), "w") as fh:
-                fh.write("unit")
+            with open(os.path.join(unit_dir, name), "w") as fh:
+                fh.write(units[name])
         for name in (guard.UNIT_NAME, guard.LIFECYCLE_PATH_NAME):
-            os.symlink("../" + name, os.path.join(self.home, ".config", "systemd", "user", "default.target.wants", name))
+            # `systemctl enable` links to the absolute unit path.
+            os.symlink(os.path.join(unit_dir, name), os.path.join(unit_dir, "default.target.wants", name))
         with open(os.path.join(self.home, ".config", "gtk-3.0", "bookmarks"), "w") as fh:
             fh.write("file:///home/igor Keep me\n")
             fh.write("dav://ff-drive@iCloud.localhost:8080/ iCloud Drive\n")
-        with open(os.path.join(self.home, ".local", "share", "nautilus-python", "extensions", guard.EXTENSION_NAME), "w") as fh:
-            fh.write("extension")
+        with open(os.path.join(self.home, ".local", "share", "nautilus-python", "extensions", guard.EXTENSION_NAME), "wb") as fh:
+            fh.write(fx.CURRENT_EXTENSION)
         with open(os.path.join(self.home, ".local", "share", "nautilus-python", "extensions", "__pycache__", "fast_fruit_drive_nautilus.cpython-313.pyc"), "wb") as fh:
             fh.write(b"bytecode")
         with open(os.path.join(self.home, ".config", "fast-fruit-drive", guard.GUARD_NAME), "w") as fh:

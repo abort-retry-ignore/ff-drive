@@ -211,7 +211,9 @@ class SafeDir:
             raise Unsafe("unsafe filename")
         if allowed_uids is None:
             allowed_uids = state_uids()
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.fd)
+        # O_NONBLOCK: a planted FIFO at a fixed registration name must fail
+        # the regular-file check instead of blocking the open.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         try:
             st = os.fstat(fd)
             self._check_dir_or_file(st, allowed_uids, directory=False)
@@ -286,6 +288,24 @@ class SafeDir:
             os.unlink(name, dir_fd=self.fd)
         except FileNotFoundError:
             pass
+
+    def unlink_symlink_to(self, name: str, targets) -> bool:
+        """Unlink ``name`` only if it is a symlink whose target is one of
+        ``targets`` verbatim. Anything else (a regular file, a link that
+        points elsewhere, a missing entry) is left untouched."""
+        if not valid_name(name):
+            raise Unsafe("unsafe filename")
+        try:
+            target = os.readlink(name, dir_fd=self.fd)
+        except OSError:  # missing, or not a symlink (EINVAL)
+            return False
+        if target not in targets:
+            return False
+        try:
+            os.unlink(name, dir_fd=self.fd)
+        except FileNotFoundError:
+            return False
+        return True
 
     def names(self) -> list[os.DirEntry]:
         with os.scandir(self.fd) as scan:
@@ -509,11 +529,119 @@ def checkout_is_ours() -> bool:
 
 # ---------------------------------------------------------------------------
 # Persistent registration cleanup
+#
+# The units and the Nautilus extension live at fixed names in directories
+# shared with everything else the user runs. Cleanup only disables, stops or
+# deletes a registration it can positively identify as written by this plugin
+# (see bin/fast-fruit-drive, "Registration ownership", which this mirrors: the
+# guard must keep working after the checkout is gone, so it cannot import it).
+# Foreign files at those names are reported and left byte-for-byte alone, and
+# the systemd state of a unit that is not ours is never touched.
+
+OWNER_MARKER = f"# Managed-By: {PLUGIN_ID}"
+UNIT_FILES = (UNIT_NAME, LIFECYCLE_SERVICE_NAME, LIFECYCLE_PATH_NAME)
+# Units with an [Install] section (the oneshot lifecycle service has none).
+ENABLED_UNITS = (UNIT_NAME, LIFECYCLE_PATH_NAME)
+UNIT_CAP = 65_536
+EXTENSION_CAP = 2_097_152
+UNIT_DESCRIPTIONS = {
+    UNIT_NAME: "Fast Fruit Drive \u2014 rclone iCloud WebDAV for Nautilus",
+    LIFECYCLE_SERVICE_NAME: "Fast Fruit Drive removal lifecycle check",
+    LIFECYCLE_PATH_NAME: "Watch Fast Fruit Drive checkout removal",
+}
+LEGACY_EXTENSION_HEADER = (
+    '"""\nFast Fruit Drive \u2014 Nautilus emblems for iCloud WebDAV cache/upload state.\n'
+).encode("utf-8")
+
+
+def _systemd_arg(value: str) -> str:
+    """Quote a fixed absolute argument for systemd's ExecStart parser."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def guard_path() -> str:
+    return os.path.join(HOME, config_rel(), GUARD_NAME)
+
+
+def plugin_checkout() -> str:
+    return os.path.join(HOME, plugin_rel())
+
+
+def _unit_bound_to_install(name: str, lines: list[str], *, legacy: bool) -> bool:
+    guard = _systemd_arg(guard_path())
+    if name == UNIT_NAME:
+        if f"ExecStart={PYTHON} -I {guard} serve" in lines:
+            return True
+        # 0.2.0 and earlier ran the checkout helper directly.
+        return legacy and f"SyslogIdentifier={APP}" in lines and any(
+            line.startswith("ExecStart=/") and line.endswith(f"/{HELPER_NAME} serve") for line in lines
+        )
+    if name == LIFECYCLE_SERVICE_NAME:
+        return f"ExecStart={PYTHON} -I {guard} lifecycle-check" in lines
+    if name == LIFECYCLE_PATH_NAME:
+        return f"Unit={LIFECYCLE_SERVICE_NAME}" in lines and f"PathChanged={plugin_checkout()}" in lines
+    return False
+
+
+def unit_is_ours(name: str, data: bytes) -> bool:
+    """Whether ``data`` is a unit this installation of the plugin wrote."""
+    try:
+        lines = data.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return False
+    description = UNIT_DESCRIPTIONS.get(name)
+    if description is None or f"Description={description}" not in lines:
+        return False
+    marked = bool(lines) and lines[0].startswith("# Managed-By:")
+    if marked and lines[0] != OWNER_MARKER:
+        return False  # explicitly claimed by something else
+    return _unit_bound_to_install(name, lines, legacy=not marked)
+
+
+def extension_is_ours(data: bytes) -> bool:
+    """Whether ``data`` is a Nautilus extension this plugin shipped."""
+    return data.startswith(OWNER_MARKER.encode("utf-8") + b"\n") or data.startswith(LEGACY_EXTENSION_HEADER)
+
+
+def inspect_registration(directory: SafeDir, name: str, cap: int, is_ours) -> tuple[str, bytes | None]:
+    """Classify ``name`` under the pinned directory as missing/ours/foreign.
+
+    Any way the entry can fail to be a plain, trusted, bounded regular file
+    (symlink, FIFO, wrong owner, group/world-writable, oversized, unreadable)
+    is "foreign": fail closed, never follow.
+    """
+    try:
+        data = directory.read_file(name, cap)
+    except FileNotFoundError:
+        return "missing", None
+    except (Unsafe, OSError):
+        return "foreign", None
+    return ("ours" if is_ours(data) else "foreign"), data
+
+
+def owned_unit_files(directory: SafeDir, *, report: bool = True) -> list[str]:
+    owned = []
+    for name in UNIT_FILES:
+        state, _ = inspect_registration(directory, name, UNIT_CAP, lambda data, n=name: unit_is_ours(n, data))
+        if state == "ours":
+            owned.append(name)
+        elif state == "foreign" and report:
+            message(f"leaving {name} in place: it was not installed by Fast Fruit Drive")
+    return owned
+
 
 def _bookmark_is_ours(line: str) -> bool:
-    if not line.startswith("dav://"):
-        return False
-    return line.startswith((DAV_URI, *LEGACY_DAV_URIS)) or "iCloud Drive" in line or "iCloud WebDAV" in line
+    """Exact-URI test for this plugin's own GTK bookmark line.
+
+    The current URI is unique to this plugin. The generic loopback URIs earlier
+    releases used could just as well be someone else's WebDAV server, so those
+    only count when the label is one this plugin wrote. A label alone never
+    identifies a bookmark.
+    """
+    uri, _, label = line.partition(" ")
+    if uri == DAV_URI:
+        return True
+    return uri in LEGACY_DAV_URIS and label.strip() in (DISPLAY_NAME, "iCloud WebDAV")
 
 
 def remove_bookmark() -> None:
@@ -540,6 +668,10 @@ def remove_extension() -> None:
     if directory is None:
         return
     try:
+        state, _ = inspect_registration(directory, EXTENSION_NAME, EXTENSION_CAP, extension_is_ours)
+        if state == "foreign":
+            message(f"leaving {EXTENSION_NAME} in place: it was not installed by Fast Fruit Drive")
+            return
         directory.unlink(EXTENSION_NAME)
         try:
             pycache = directory.enter("__pycache__")
@@ -557,28 +689,56 @@ def remove_extension() -> None:
         directory.close()
 
 
-def remove_unit_files() -> None:
-    for rel, names in (
-        (unit_rel(), (UNIT_NAME, LIFECYCLE_SERVICE_NAME, LIFECYCLE_PATH_NAME)),
-        (wants_rel(), (UNIT_NAME, LIFECYCLE_PATH_NAME)),
-    ):
-        directory = open_relative(rel)
-        if directory is None:
-            continue
+def remove_unit_files(owned: list[str]) -> None:
+    """Delete the ``owned`` unit files and their enablement symlinks."""
+    directory = open_relative(unit_rel())
+    if directory is not None:
         try:
-            for name in names:
-                directory.unlink(name)
+            for name in owned:
+                # Re-check through the same pinned descriptor right before
+                # deleting: a name that stopped being ours is left alone.
+                state, _ = inspect_registration(directory, name, UNIT_CAP, lambda data, n=name: unit_is_ours(n, data))
+                if state == "ours":
+                    directory.unlink(name)
+        except (Unsafe, OSError) as exc:
+            message(f"could not safely remove unit registration: {exc}")
+        finally:
+            directory.close()
+    directory = open_relative(wants_rel())
+    if directory is not None:
+        try:
+            for name in ENABLED_UNITS:
+                if name in owned:
+                    # Only the enablement symlink pointing at our unit file.
+                    directory.unlink_symlink_to(
+                        name, {os.path.join(HOME, unit_rel(), name), "../" + name}
+                    )
         except (Unsafe, OSError) as exc:
             message(f"could not safely remove unit registration: {exc}")
         finally:
             directory.close()
 
 
+def _owned_units_now(*, report: bool) -> list[str]:
+    directory = open_relative(unit_rel())
+    if directory is None:
+        return []
+    try:
+        return owned_unit_files(directory, report=report)
+    finally:
+        directory.close()
+
+
 def disarm_unit() -> None:
     # The user manager, not this possibly sandboxed process, removes the
     # wants symlink. This is the mandatory safety action when validation
-    # fails; filesystem cleanup below is best effort and idempotent.
-    run_tool(SYSTEMCTL, ["--user", "disable", UNIT_NAME, LIFECYCLE_PATH_NAME], timeout=12)
+    # fails; filesystem cleanup below is best effort and idempotent. Only
+    # units this plugin wrote are disabled: a same-named unit from anything
+    # else is not ours to switch off.
+    owned = _owned_units_now(report=False)
+    enabled = [name for name in ENABLED_UNITS if name in owned]
+    if enabled:
+        run_tool(SYSTEMCTL, ["--user", "disable", *enabled], timeout=12)
 
 
 def cleanup(mode: str) -> None:
@@ -586,13 +746,18 @@ def cleanup(mode: str) -> None:
         raise Unsafe("invalid cleanup mode")
     for uri in (DAV_URI, *LEGACY_DAV_URIS):
         run_tool(GIO, ["mount", "-u", uri], timeout=8)
+    owned = _owned_units_now(report=True)
+    enabled = [name for name in ENABLED_UNITS if name in owned]
     # Do not stop the lifecycle service itself here: this invocation may be
     # that service. Disabling/stopping the path unit is sufficient, and both
     # unit files are removed below after this guard has finished using them.
-    run_tool(SYSTEMCTL, ["--user", "disable", "--now", UNIT_NAME, LIFECYCLE_PATH_NAME], timeout=20)
-    remove_unit_files()
-    run_tool(SYSTEMCTL, ["--user", "reset-failed", UNIT_NAME], timeout=8)
-    run_tool(SYSTEMCTL, ["--user", "daemon-reload"], timeout=12)
+    if enabled:
+        run_tool(SYSTEMCTL, ["--user", "disable", "--now", *enabled], timeout=20)
+    remove_unit_files(owned)
+    if UNIT_NAME in owned:
+        run_tool(SYSTEMCTL, ["--user", "reset-failed", UNIT_NAME], timeout=8)
+    if owned:
+        run_tool(SYSTEMCTL, ["--user", "daemon-reload"], timeout=12)
     remove_bookmark()
     remove_extension()
     # No data path is removed. Keep the independent guard as inert config:
