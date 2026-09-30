@@ -229,7 +229,9 @@ class LifecycleQmlTests(unittest.TestCase):
         self.assertIn('runControl(["mount"])', qml)
         self.assertIn("mountDrive", qml)
         # Retries must be bounded, not a busy loop while the mount fails.
-        self.assertIn("_mountTries < 3", qml)
+        self.assertIn("_mountTries >= 3", qml)
+        self.assertIn("Qt.callLater(root.restoreMount)", qml)
+        self.assertIn("_desired === 0", qml)
 
 
 if __name__ == "__main__":

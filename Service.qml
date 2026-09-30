@@ -218,17 +218,22 @@ Item {
     cacheUsedBytes = Number(parsed.cacheUsedBytes || 0)
     lastError = String(parsed.lastError || "")
     if (_desired !== -1 && running === (_desired === 1)) _desired = -1
-    // After a reboot the running server has no GVFS mount until something
-    // mounts it with the local credential; remount from here so the
-    // sidebar bookmark opens without a password prompt. The helper only
-    // sends that credential after verifying the listener belongs to the
-    // sandboxed service. Bounded retries cover GVFS not being ready yet
-    // when the shell loads; a successful mount resets the counter.
-    if (root.mounted) root._mountTries = 0
-    else if (root.running && !root.busy && root._mountTries < 3) {
-      root._mountTries += 1
-      root.mountDrive()
+    // Quickshell emits onExited before runningChanged updates bindings:
+    // busy can still be true here even though statusProcess has finished.
+    Qt.callLater(root.restoreMount)
+  }
+
+  function restoreMount() {
+    // Re-establish the per-session GVFS mount through the verified helper,
+    // never by remembering the password in a URI or keyring. Do not race
+    // an explicit stop, start a stopped server, or retry without a limit.
+    if (!running || mounted) {
+      _mountTries = 0
+      return
     }
+    if (!ready || busy || _desired === 0 || _mountTries >= 3) return
+    _mountTries += 1
+    mountDrive()
   }
 
   function elideStatus(text) {

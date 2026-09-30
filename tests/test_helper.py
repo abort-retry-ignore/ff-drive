@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HELPER_PATH = os.path.join(ROOT, "bin", "fast-fruit-drive")
@@ -397,6 +398,42 @@ class MountCommandTests(unittest.TestCase):
 
     def test_usage_lists_mount(self):
         self.assertIn("mount", ffd.USAGE)
+
+    def test_mount_refuses_stopped_service_without_side_effects(self):
+        with mock.patch.object(ffd, "service_running", return_value=False), \
+             mock.patch.object(ffd, "wait_for_server") as ready, \
+             mock.patch.object(ffd, "do_mount") as mount, \
+             mock.patch.object(ffd, "ensure_bookmark") as bookmark, \
+             mock.patch.object(ffd, "systemctl") as systemctl:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_mount([])
+            ready.assert_not_called()
+            mount.assert_not_called()
+            bookmark.assert_not_called()
+            systemctl.assert_not_called()
+
+    def test_mount_checks_readiness_before_mounting_without_reinstall(self):
+        calls = []
+        with mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "wait_for_server", side_effect=lambda: calls.append("ready")), \
+             mock.patch.object(ffd, "do_mount", side_effect=lambda: calls.append("mount")), \
+             mock.patch.object(ffd, "ensure_bookmark", side_effect=lambda: calls.append("bookmark")), \
+             mock.patch.object(ffd, "cmd_ensure") as ensure, \
+             mock.patch.object(ffd, "systemctl") as systemctl:
+            ffd.cmd_mount([])
+            self.assertEqual(calls, ["ready", "mount", "bookmark"])
+            ensure.assert_not_called()
+            systemctl.assert_not_called()
+
+    def test_failed_readiness_does_not_attempt_mount(self):
+        with mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "wait_for_server", side_effect=SystemExit(1)), \
+             mock.patch.object(ffd, "do_mount") as mount, \
+             mock.patch.object(ffd, "ensure_bookmark") as bookmark:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_mount([])
+            mount.assert_not_called()
+            bookmark.assert_not_called()
 
 
 class SuperviseGuardTests(unittest.TestCase):

@@ -86,6 +86,13 @@ undetected. So the server requires a per-install credential:
   `rclone` binary, and that its arguments actually request authenticated
   WebDAV — not merely that *some* process is listening on the port.
 
+GVFS mounts are per desktop session. When the enabled widget observes an
+already-running server without a mount, it restores that mount through the
+same supervised, listener-verified helper path, with at most three automatic
+attempts until the server stops or a mount succeeds. It does not start a
+stopped server, persist the password in a keyring, or create any additional
+systemd registrations. An explicit stop takes priority over automatic mounting.
+
 An unauthenticated request gets HTTP 401:
 
 ```console

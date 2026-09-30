@@ -78,8 +78,11 @@ cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
 - Left click: panel
 - Right click: refresh
 - Middle click: open in Nautilus
-- After a reboot the widget re-mounts the drive within one refresh cycle, so
-  the Nautilus **iCloud Drive** bookmark opens with no password prompt
+- After a reboot the enabled widget restores the authenticated GVFS mount
+  for an already-running server; no password needs to be typed or saved.
+  If you click the sidebar before it is ready and see an authentication
+  prompt, cancel it and use the widget's **Open in Nautilus** action. That
+  prompt is for the local WebDAV credential, not your Apple password.
 - In the panel: toggle the server, open Nautilus, sign in
 - Keys: `r` refresh, `o` open, `i` sign in, `p` / Enter on the switch to toggle
 
@@ -181,3 +184,6 @@ omarchy plugin validate .
 qmllint -I "${OMARCHY_PATH:-/usr/share/omarchy}/shell" Service.qml FruitIcon.qml
 python3 -m unittest discover -s tests -v
 ```
+
+Optional QML runtime tests use an installed Quickshell with a fake helper
+and skip when it is unavailable. They never contact systemd, GVFS, or Apple.
