@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.abort-retry-ignore.ff-drive",
   "name": "Fast Fruit Drive",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "Igor Divjak",
   "license": "MIT",
   "description": "Fast iCloud Drive in Nautilus, from the bar. Browse even a huge drive instantly \u2014 listings stay in the cloud, and only files you open are cached.",

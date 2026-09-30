@@ -168,6 +168,11 @@ WebDAV authentication and the pending-upload guard on `clear-cache` and
   raw output at 64 KiB per stream before any line parsing, enforces a
   wall-clock deadline, and group-kills and reaps the whole process tree on
   timeout or overflow.
+- Only files this plugin wrote are ever replaced, disabled, stopped or
+  deleted. The systemd units and Nautilus extension carry an ownership marker
+  (`# Managed-By: io.github.abort-retry-ignore.ff-drive`); if a different file
+  already has one of those names, setup refuses and leaves it untouched, and
+  removal skips it. See the ownership section of SECURITY.md.
 - Neither enabled systemd registration points at the marketplace checkout.
   The main unit and checkout-change watcher invoke the independent guard,
   which validates the exact fixed checkout path and manifest ID through

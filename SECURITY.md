@@ -162,13 +162,76 @@ removed checkout. This is
 a fallback as well as removal protection: even if desktop lifecycle cleanup is
 interrupted, the next service invocation fails closed.
 
-Disable/removal cleanup stops/disables the unit, removes its unit file and
-wants link, unmounts the fixed DAV URI, removes only this plugin's GTK bookmark
-and Nautilus extension/bytecode. It deliberately does **not** delete
+Disable/removal cleanup stops/disables the units it wrote, removes those unit
+files and their wants links, unmounts the fixed DAV URI, removes only this
+plugin's GTK bookmark and the Nautilus extension/bytecode it installed (each
+subject to the ownership rules below). It deliberately does **not** delete
 configuration, including the now-inert guard, local WebDAV credentials, cache,
 or `rclone.conf`; preserving a possible `Dirty: true` cache is safer than
 losing an upload. The explicit `uninstall` command remains the only full state
 purge and retains its pending-upload refusal.
+
+### Ownership of shared registrations
+
+The three systemd user units (`fast-fruit-drive.service`,
+`fast-fruit-drive-lifecycle.service`, `fast-fruit-drive-lifecycle.path`), their
+`default.target.wants` links, and the Nautilus extension
+(`fast_fruit_drive_nautilus.py`) live at fixed names in directories shared with
+everything else the user runs. The plugin only overwrites, disables, stops or
+deletes a registration it can positively identify as its own; the same rules
+are implemented independently by the helper and by the guard (which must keep
+working after the checkout is gone), and a test asserts both classify every
+fixture identically.
+
+**Identity.** Every file the plugin writes begins with
+`# Managed-By: io.github.abort-retry-ignore.ff-drive`. A unit only counts as
+ours if that marker is its first line **and** it is bound to this account's
+installation: the service units must execute the guard copy under this
+account's `~/.config/fast-fruit-drive/`, and the path unit must watch this
+account's fixed plugin checkout and trigger our lifecycle service. The
+extension counts as ours if the marker is its first line. Files written by
+0.2.x and earlier have no marker; they are recognised only by their exact
+generated shape (the unit's `Description=`, a `SyslogIdentifier=` and an
+`ExecStart=` that runs this plugin, or the extension's original header) and
+are rewritten with the marker on first write. A marker naming any other plugin
+is treated as foreign.
+
+**Install** (`ensure`, `start`, `restart`, lifecycle migration). All three unit
+files and the extension are checked through the same retained directory
+descriptors used to write them, before anything is written. If any is foreign
+the command fails with a message naming the file and changes nothing: no unit,
+config, bookmark or extension is written, systemd is not contacted, and the
+foreign file is left byte-for-byte intact. Anything that is not a plain,
+bounded regular file owned by you or root and not group/world-writable
+(symlink, FIFO, other owner, oversized) is foreign; symlinked dotfiles are
+never replaced. Reads use `O_NONBLOCK`, so a planted FIFO cannot hang the
+check. The extension source is also required to carry the marker, so the plugin
+never installs a file it could not later recognise.
+
+**Runtime control.** Status, `start`, `stop` and `restart` only address
+`fast-fruit-drive.service` when the file at that name is ours; otherwise the
+unit is never queried as if it were ours and never stopped or restarted.
+
+**Removal** (`uninstall`, and the guard's disable/remove cleanup and
+fail-closed disarm). Each unit is classified individually. Only units that are
+ours are passed to `systemctl disable --now`, have `reset-failed` issued, and
+are deleted (re-checked through the same descriptor immediately before the
+unlink). A foreign unit of the same name keeps its file, its enablement and
+its runtime state, and is reported on stderr. A `default.target.wants` entry is
+removed only if it is a symlink whose target is our own unit file. The
+extension and its bytecode are removed only if the extension is ours.
+
+**Bookmarks.** The GTK bookmark is matched by exact URI, never by label. The
+current URI (`dav://ff-drive@iCloud.localhost:8080/`) is unique to this plugin;
+the generic loopback URIs earlier releases used only count when they also carry
+a label this plugin wrote, so another tool's bookmark that merely says "iCloud
+Drive" is preserved.
+
+**Not covered.** The ownership check and the atomic rename are two steps within
+one pinned directory; a process running as you that swaps the file between them
+is outside the threat model (it could equally edit the unit directly). The
+early-release `gio mount -u` of the generic loopback legacy URIs during
+cleanup is unchanged.
 
 ## Process isolation
 
