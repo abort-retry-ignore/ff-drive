@@ -55,13 +55,17 @@ State this plugin writes, all under your own home directory:
 - `~/.local/share/nautilus-python/extensions/fast_fruit_drive_nautilus.py`
   — the emblem extension
 - `~/.config/fast-fruit-drive/config` — cache size/age only
+- `~/.config/fast-fruit-drive/session-check` — the last iCloud session
+  verdict (see "Session validity check"); holds a SHA-256 fingerprint,
+  never a token
 - `~/.config/fast-fruit-drive/webdav-password`,
   `~/.config/fast-fruit-drive/webdav.htpasswd` — the local WebDAV
   credential (below)
 - `~/.cache/fast-fruit-drive/` — the on-demand file cache
 
 `~/.config/rclone/rclone.conf` is rclone's own file. This plugin only reads
-it to check whether a remote and session exist; it never writes to it.
+it to check whether a remote and session exist, and to fingerprint the trust
+token (below); it never writes to it.
 
 ## Local WebDAV authentication
 
@@ -254,6 +258,49 @@ The widget itself only ever sees this already-bounded output. Its own
 watchdog timers are a backstop for the case the supervisor process itself
 hangs (a bug, not normal operation): they signal the exact PID Quickshell
 reports for that process, not a guessed process-group ID.
+
+## Session validity check
+
+A trust token in `rclone.conf` says nothing about whether iCloud still
+accepts it (it lapses after about 30 days), and rclone only finds out when it
+calls iCloud. Without a check, a dead session looks like a healthy service
+and Nautilus ends up showing a password prompt. The plugin therefore asks
+iCloud, and treats the answer as a verdict: `ok`, `expired`, `pcs` (signed in
+but Apple withheld the web session, e.g. pending iCloud Terms & Conditions),
+or `unknown` (offline, timeout, anything that is not clearly an auth problem).
+`unknown` is never treated as a failure.
+
+- **Probe.** `rclone lsd icloud:` through the same verified rclone binary and
+  allow-listed environment as everything else, via `run_bounded` (hard
+  deadline, raw byte cap, process-group kill). Its output is only matched
+  against fixed patterns; it is never stored or shown.
+- **Cache.** `~/.config/fast-fruit-drive/session-check` (mode 600, written
+  atomically through the pinned config directory). It stores the verdict, a
+  timestamp, and a SHA-256 of the trust token so a new sign-in invalidates it.
+  The token itself is not stored.
+- **`status` never blocks on the network.** It reads the cache. Only while the
+  service is running, and only when the verdict is stale (10 minutes if `ok`,
+  2 minutes otherwise), it spawns one hidden `__check-session` process:
+  verified `python3 -I` on this same file, fixed argv, its own session. A
+  `pending` marker keeps probes from overlapping and expires after 60 seconds.
+  It is not reachable through the widget supervisor.
+- **On a bad verdict** the plugin unmounts only its own `dav://` URI (not the
+  legacy loopback URIs the removal cleanup handles) and removes only its own
+  bookmark line, so Nautilus has no entry that can only produce a password
+  prompt. It does not stop or start the service. `ensure_bookmark` refuses to
+  re-add the bookmark while the cached verdict is bad.
+- **Notification.** On the first bad verdict for a given credential, one
+  desktop notification via the verified `notify-send` (under `/usr/bin` or
+  `/usr/local/bin`), fixed strings only, arguments after `--`, no shell, 5
+  second deadline. Nothing from rclone or Apple is ever placed in it.
+- **Sign-in.** After `rclone config reconnect` the terminal re-checks (with a
+  few retries for `unknown`), then starts the drive, or restarts it if it was
+  running so the new session is picked up.
+
+What it cannot tell: rclone reports pending Terms & Conditions and a disabled
+"Access iCloud Data on the Web" with the same error, so the notification and
+terminal name both. The probe uses the credentials rclone already holds, the
+same as the service; it adds no new credential or network destination.
 
 ## Pending uploads are protected
 
