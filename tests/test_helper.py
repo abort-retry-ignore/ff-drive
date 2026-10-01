@@ -855,6 +855,34 @@ class SessionValidityTests(SandboxedHome):
         systemctl.assert_not_called()
 
 
+class ServeArgumentsTests(SandboxedHome):
+    def serve_argv(self):
+        captured = {}
+        saved = ffd.Tools.rclone
+        ffd.Tools.rclone = "/usr/bin/rclone"
+        try:
+            with mock.patch.object(ffd, "remote_configured", return_value=True), \
+                 mock.patch.object(ffd, "validate_webdav_auth", return_value="pw"), \
+                 mock.patch.object(ffd.os, "execve", side_effect=lambda path, args, env: captured.update(args=args)):
+                ffd.cmd_serve([])
+        finally:
+            ffd.Tools.rclone = saved
+        return captured["args"]
+
+    def test_unknown_folder_dates_are_shown_as_the_epoch_not_year_2000(self):
+        # iCloud gives folders no modified time; rclone's placeholder is
+        # 2000-01-01, which reads as a real (and absurd) date. Nautilus treats
+        # exactly 0 as "unknown".
+        args = self.serve_argv()
+        self.assertEqual(args[args.index("--default-time") + 1], "1970-01-01T00:00:00Z")
+
+    def test_serve_stays_loopback_only_and_authenticated(self):
+        args = self.serve_argv()
+        self.assertIn("--htpasswd", args)
+        addrs = [args[i + 1] for i, a in enumerate(args) if a == "--addr"]
+        self.assertEqual(addrs, ["127.0.0.1:8080", "[::1]:8080"])
+
+
 class SuperviseGuardTests(unittest.TestCase):
     def test_serve_and_login_tui_are_not_supervisable(self):
         self.assertNotIn("serve", ffd.SUPERVISABLE_COMMANDS)

@@ -75,6 +75,7 @@ PORT = 8080
 DAV_HOST = "iCloud.localhost"
 DISPLAY_NAME = "iCloud Drive"
 VFS_CACHE_MODE = "full"
+UNKNOWN_MODTIME = "1970-01-01T00:00:00Z"  # Unix epoch: shown by Nautilus as "unknown"
 WEBDAV_USER = "ff-drive"
 
 DAV_URI = f"dav://{WEBDAV_USER}@{DAV_HOST}:{PORT}/"
@@ -1865,6 +1866,10 @@ def cmd_serve(_args) -> None:
         "--vfs-read-ahead", "0",
         "--poll-interval", "0",
         "--dir-cache-time", "30s",
+        # iCloud gives folders no modified date, and rclone would show its
+        # placeholder (2000-01-01) as if it were real. Nautilus treats a
+        # modified time of exactly 0 as unknown and leaves it blank.
+        "--default-time", UNKNOWN_MODTIME,
         "--cache-dir", CACHE_DIR,
         "--htpasswd", f"/proc/self/fd/{authdir.fd}/{WEBDAV_HTPASSWD_FILE}",
     ]

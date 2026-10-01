@@ -106,6 +106,11 @@ cache (`--vfs-cache-mode full`). Copying in Nautilus also works.
 - In the panel: toggle the server, open Nautilus, sign in
 - Keys: `r` refresh, `o` open, `i` sign in, `p` / Enter on the switch to toggle
 
+Folder dates: iCloud gives folders no modified date (only a created date), and
+rclone would otherwise show its placeholder of 1 Jan 2000. The service tells
+rclone to report the Unix epoch instead, which Nautilus treats as unknown, so
+the Modified column is blank for folders. Files keep their real dates.
+
 Nautilus emblems (same idea as StratoSync):
 
 - spinning arrows — still uploading (`Dirty` in the VFS cache)
