@@ -64,6 +64,26 @@ if the remote does not exist yet).
 - That trust token lasts **about 30 days**. After it expires, Sign in again.
 - Fast Fruit Drive never copies or replaces that file; it only reads whether a session exists.
 
+A token sitting in `rclone.conf` does not mean iCloud still accepts it, so the
+plugin asks iCloud (`rclone lsd icloud:`) rather than trusting the file. When the
+session has expired, the widget shows **iCloud session expired** with a **Reconnect**
+button, Super-Shift-F opens the sign-in terminal instead of Nautilus, and the
+sidebar bookmark/mount is removed so Nautilus never shows a password prompt. After
+you sign in, the drive is started (or restarted, if it was running) and mounted
+automatically. When a bad session is first detected you also get a desktop
+notification, once per sign-in and problem, so it never fails silently. The check runs in the background (at most every 10 minutes while the
+drive is on, and again immediately after any new sign-in); being offline is never
+treated as expiry.
+
+If sign-in succeeds but rclone then fails with `Missing X-APPLE-WEBAUTH-TOKEN cookie`
+(the widget says **iCloud sign-in incomplete**), Apple withheld the web session. The usual
+cause is iCloud Terms & Conditions waiting for you: open <https://www.icloud.com> in a
+browser, accept them, then Sign in again. The plugin cannot tell that apart from the web
+access switch being off (rclone reports both identically), so the notification and the
+sign-in terminal name both, Terms first. With Advanced Data Protection, also make sure
+*Access iCloud Data on the Web* is on. See
+[rclone #9658](https://github.com/rclone/rclone/issues/9658).
+
 ## Why
 
 A FUSE mount of the whole drive (rclone mount / StratoSync) walks iCloud as if

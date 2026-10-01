@@ -19,6 +19,8 @@ Item {
   property bool remoteConfigured: false
   property bool hasSession: false
   property bool needsLogin: false
+  property bool sessionExpired: false
+  property string sessionProblem: ""
   property bool gvfsDav: false
   property bool refreshing: false
   property string statusText: "Checking…"
@@ -208,6 +210,8 @@ Item {
     remoteConfigured = parsed.remoteConfigured === true
     hasSession = parsed.hasSession === true
     needsLogin = parsed.needsLogin === true
+    sessionExpired = parsed.sessionExpired === true
+    sessionProblem = String(parsed.sessionProblem || "")
     gvfsDav = parsed.gvfsDav === true
     statusText = String(parsed.statusText || (running ? "Connected" : "Stopped"))
     remote = String(parsed.remote || "icloud:")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import importlib.machinery
+import io
 import importlib.util
 import os
 import shutil
@@ -418,18 +419,20 @@ class MountCommandTests(unittest.TestCase):
     def test_mount_checks_readiness_before_mounting_without_reinstall(self):
         calls = []
         with mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "require_valid_session", side_effect=lambda: calls.append("session")), \
              mock.patch.object(ffd, "wait_for_server", side_effect=lambda: calls.append("ready")), \
              mock.patch.object(ffd, "do_mount", side_effect=lambda: calls.append("mount")), \
              mock.patch.object(ffd, "ensure_bookmark", side_effect=lambda: calls.append("bookmark")), \
              mock.patch.object(ffd, "cmd_ensure") as ensure, \
              mock.patch.object(ffd, "systemctl") as systemctl:
             ffd.cmd_mount([])
-            self.assertEqual(calls, ["ready", "mount", "bookmark"])
+            self.assertEqual(calls, ["session", "ready", "mount", "bookmark"])
             ensure.assert_not_called()
             systemctl.assert_not_called()
 
     def test_failed_readiness_does_not_attempt_mount(self):
         with mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "require_valid_session"), \
              mock.patch.object(ffd, "wait_for_server", side_effect=SystemExit(1)), \
              mock.patch.object(ffd, "do_mount") as mount, \
              mock.patch.object(ffd, "ensure_bookmark") as bookmark:
@@ -437,6 +440,419 @@ class MountCommandTests(unittest.TestCase):
                 ffd.cmd_mount([])
             mount.assert_not_called()
             bookmark.assert_not_called()
+
+
+class SessionValidityTests(SandboxedHome):
+    """An rclone.conf that still holds a trust token is not a valid session:
+    iCloud rejects an expired one, and the failure used to surface as a
+    Nautilus password prompt. These pin the detection and its handling."""
+
+    def setUp(self):
+        super().setUp()
+        self.conf_dir = ffd.RCLONE_CONF_DIR
+        os.makedirs(self.conf_dir, 0o700)
+        os.makedirs(ffd.CONFIG_DIR, 0o700)
+        self.write_conf("trust-one")
+        self._tools = (ffd.Tools.rclone, ffd.Tools.python3)
+        ffd.Tools.rclone = "/usr/bin/rclone"
+        ffd.Tools.python3 = "/usr/bin/python3"
+
+    def tearDown(self):
+        ffd.Tools.rclone, ffd.Tools.python3 = self._tools
+        super().tearDown()
+
+    def write_conf(self, token):
+        path = os.path.join(self.conf_dir, "rclone.conf")
+        with open(path, "w") as fh:
+            fh.write(f"[icloud]\ntype = iclouddrive\ntrust_token = {token}\ncookies = c\n")
+        os.chmod(path, 0o600)
+
+    def result(self, rc=0, err=b"", out=b"", timed_out=False):
+        return ffd.BoundedResult(rc, out, err, timed_out=timed_out)
+
+    def test_probe_ok(self):
+        with mock.patch.object(ffd, "run_bounded", return_value=self.result()):
+            self.assertEqual(ffd.probe_session(), "ok")
+
+    def test_probe_recognises_the_real_expiry_error(self):
+        err = (b"ERROR : error listing: HTTP error 421 (421 Misdirected Request) returned body: "
+               b"\"{\\\"reason\\\":\\\"Invalid global session\\\",\\\"error\\\":2}\"")
+        with mock.patch.object(ffd, "run_bounded", return_value=self.result(rc=1, err=err)):
+            self.assertEqual(ffd.probe_session(), "expired")
+
+    def test_probe_does_not_mistake_network_trouble_for_expiry(self):
+        for res in (self.result(rc=1, err=b"dial tcp: lookup p63-drivews.icloud.com: no such host"),
+                    self.result(rc=1, err=b"2026/10/01 22:17:421 NOTICE: something else"),
+                    self.result(timed_out=True, rc=-9)):
+            with mock.patch.object(ffd, "run_bounded", return_value=res):
+                self.assertEqual(ffd.probe_session(), "unknown")
+
+    def test_fingerprint_follows_trust_token_not_secret_text(self):
+        first = ffd.session_fingerprint()
+        self.assertNotIn("trust-one", first)
+        self.assertEqual(first, ffd.session_fingerprint())
+        self.write_conf("trust-two")
+        self.assertNotEqual(first, ffd.session_fingerprint())
+
+    def test_refresh_records_verdict_and_drops_entry_on_expiry(self):
+        with mock.patch.object(ffd, "probe_session", return_value="expired"), \
+             mock.patch.object(ffd, "drop_dav_entry") as drop:
+            self.assertEqual(ffd.refresh_session(), "expired")
+            drop.assert_called_once()
+        with mock.patch.object(ffd, "spawn_detached") as spawn:
+            self.assertEqual(ffd.cached_session_state(allow_probe=True), "expired")
+            spawn.assert_not_called()  # fresh verdict, nothing to re-probe
+
+    def test_good_refresh_leaves_the_entry_alone(self):
+        with mock.patch.object(ffd, "probe_session", return_value="ok"), \
+             mock.patch.object(ffd, "drop_dav_entry") as drop:
+            self.assertEqual(ffd.refresh_session(), "ok")
+            drop.assert_not_called()
+
+    def test_new_sign_in_invalidates_a_cached_expired_verdict(self):
+        with mock.patch.object(ffd, "probe_session", return_value="expired"), \
+             mock.patch.object(ffd, "drop_dav_entry"):
+            ffd.refresh_session()
+        self.write_conf("trust-two")
+        with mock.patch.object(ffd, "spawn_detached"):
+            self.assertEqual(ffd.cached_session_state(allow_probe=False), "unknown")
+
+    def test_status_never_probes_while_stopped(self):
+        with mock.patch.object(ffd, "spawn_detached") as spawn:
+            self.assertEqual(ffd.cached_session_state(allow_probe=False), "unknown")
+            spawn.assert_not_called()
+
+    def test_stale_verdict_spawns_exactly_one_background_probe(self):
+        with mock.patch.object(ffd, "spawn_detached") as spawn:
+            self.assertEqual(ffd.cached_session_state(allow_probe=True), "unknown")
+            self.assertEqual(ffd.cached_session_state(allow_probe=True), "unknown")
+            self.assertEqual(spawn.call_count, 1)
+            argv = spawn.call_args[0][0]
+            self.assertEqual(argv[-1], "__check-session")
+
+    def test_dead_background_probe_is_retried(self):
+        with mock.patch.object(ffd, "spawn_detached") as spawn:
+            ffd.cached_session_state(allow_probe=True)
+            record = ffd._load_session_check()
+            record["pending"] = int(time.time()) - int(ffd.SESSION_PENDING_TTL) - 5
+            ffd._store_session_check(record)
+            ffd.cached_session_state(allow_probe=True)
+            self.assertEqual(spawn.call_count, 2)
+
+    def status_payload(self, verdict):
+        import io
+        out = io.StringIO()
+        with mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "gio_mounted", return_value=False), \
+             mock.patch.object(ffd, "cache_bytes", return_value=0), \
+             mock.patch.object(ffd, "cached_session_state", return_value=verdict), \
+             contextlib.redirect_stdout(out):
+            ffd.cmd_status([])
+        return json.loads(out.getvalue())
+
+    def test_status_reports_expiry_as_needs_login_and_not_ready(self):
+        payload = self.status_payload("expired")
+        self.assertTrue(payload["hasSession"])  # token is still there...
+        self.assertTrue(payload["sessionExpired"])  # ...but iCloud rejects it
+        self.assertTrue(payload["needsLogin"])
+        self.assertFalse(payload["ready"])  # widget must stop retrying the mount
+        self.assertEqual(payload["statusText"], "iCloud session expired")
+
+    def test_status_with_a_good_session_is_unchanged(self):
+        payload = self.status_payload("ok")
+        self.assertFalse(payload["sessionExpired"])
+        self.assertFalse(payload["needsLogin"])
+
+    def test_start_refuses_before_starting_the_server(self):
+        with mock.patch.object(ffd, "cmd_ensure"), \
+             mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd, "refresh_session", return_value="expired"), \
+             mock.patch.object(ffd, "systemctl") as systemctl, \
+             mock.patch.object(ffd, "do_mount") as mount:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_start([])
+            systemctl.assert_not_called()
+            mount.assert_not_called()
+
+    def test_offline_unknown_does_not_block_start(self):
+        with mock.patch.object(ffd, "refresh_session", return_value="unknown"):
+            ffd.require_valid_session()  # must not raise
+
+    def test_mount_refuses_expired_session_without_mounting(self):
+        with mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "refresh_session", return_value="expired"), \
+             mock.patch.object(ffd, "wait_for_server") as ready, \
+             mock.patch.object(ffd, "do_mount") as mount, \
+             mock.patch.object(ffd, "ensure_bookmark") as bookmark:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_mount([])
+            ready.assert_not_called()
+            mount.assert_not_called()
+            bookmark.assert_not_called()  # never re-add the prompting bookmark
+
+    def test_open_with_expired_session_goes_to_sign_in_not_nautilus(self):
+        with mock.patch.object(ffd, "refresh_session", return_value="expired"), \
+             mock.patch.object(ffd, "cmd_login") as login, \
+             mock.patch.object(ffd, "spawn_detached") as spawn, \
+             mock.patch.object(ffd, "cmd_start") as start, \
+             mock.patch.object(ffd, "do_mount") as mount:
+            ffd.cmd_open([])
+            login.assert_called_once()
+            spawn.assert_not_called()
+            start.assert_not_called()
+            mount.assert_not_called()
+
+    PCS_ERR = (b"CRITICAL: Failed to create file system for \"icloud:\": requestPCS(iclouddrive): "
+               b"HTTP error 500 (500 Internal Server Error) returned body: "
+               b"\"{\\\"success\\\":false,\\\"error\\\":\\\"Missing X-APPLE-WEBAUTH-TOKEN cookie\\\"}\"")
+
+    def test_probe_recognises_signed_in_but_no_web_access(self):
+        # Real failure after a fresh `rclone config reconnect` on an ADP
+        # account (rclone issue #9658): not an expiry, needs different advice.
+        with mock.patch.object(ffd, "run_bounded", return_value=self.result(rc=1, err=self.PCS_ERR)):
+            self.assertEqual(ffd.probe_session(), "pcs")
+
+    def test_pcs_verdict_is_treated_like_expiry_everywhere(self):
+        with mock.patch.object(ffd, "probe_session", return_value="pcs"), \
+             mock.patch.object(ffd, "drop_dav_entry") as drop:
+            self.assertEqual(ffd.refresh_session(), "pcs")
+            drop.assert_called_once()
+        with mock.patch.object(ffd, "spawn_detached"):
+            self.assertEqual(ffd.cached_session_state(allow_probe=False), "pcs")
+        with mock.patch.object(ffd, "refresh_session", return_value="pcs"):
+            with self.assertRaises(SystemExit):
+                ffd.require_valid_session()
+
+    def test_status_reports_pcs_problem_distinctly(self):
+        payload = self.status_payload("pcs")
+        self.assertTrue(payload["needsLogin"])
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["sessionProblem"], "pcs")
+        self.assertEqual(payload["statusText"], "iCloud sign-in incomplete")
+        self.assertEqual(self.status_payload("expired")["sessionProblem"], "expired")
+        self.assertEqual(self.status_payload("ok")["sessionProblem"], "")
+
+    def test_failed_start_does_not_leave_a_dead_sidebar_bookmark(self):
+        # cmd_ensure runs before the session check in `start`; the bookmark
+        # it writes must not appear while the verdict is bad.
+        with mock.patch.object(ffd, "probe_session", return_value="pcs"), \
+             mock.patch.object(ffd, "drop_dav_entry"):
+            ffd.refresh_session()
+        with mock.patch.object(ffd, "rewrite_bookmarks") as rewrite:
+            ffd.ensure_bookmark()
+            rewrite.assert_not_called()
+
+    def test_bookmark_is_written_with_a_good_or_unknown_verdict(self):
+        with mock.patch.object(ffd, "rewrite_bookmarks") as rewrite:
+            ffd.ensure_bookmark()  # nothing cached yet -> unknown
+            rewrite.assert_called_once()
+        with mock.patch.object(ffd, "probe_session", return_value="ok"):
+            ffd.refresh_session()
+        with mock.patch.object(ffd, "rewrite_bookmarks") as rewrite:
+            ffd.ensure_bookmark()
+            rewrite.assert_called_once()
+
+    def test_new_sign_in_brings_the_bookmark_back(self):
+        with mock.patch.object(ffd, "probe_session", return_value="pcs"), \
+             mock.patch.object(ffd, "drop_dav_entry"):
+            ffd.refresh_session()
+        self.write_conf("trust-two")
+        with mock.patch.object(ffd, "rewrite_bookmarks") as rewrite:
+            ffd.ensure_bookmark()
+            rewrite.assert_called_once()
+
+    def test_login_with_no_web_access_explains_and_restarts_nothing(self):
+        out = io.StringIO()
+        with mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd.subprocess, "run"), \
+             mock.patch.object(ffd, "fresh_session_state", return_value="pcs"), \
+             mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "systemctl") as systemctl, \
+             contextlib.redirect_stdout(out):
+            ffd.cmd_login_tui([])
+        systemctl.assert_not_called()
+        self.assertIn("Access iCloud Data on the Web", out.getvalue())
+        self.assertIn("icloud.com", out.getvalue())
+        self.assertIn("Terms", out.getvalue())
+
+    # ---- desktop notification on a bad verdict -------------------------
+
+    def refresh(self, verdict, **kw):
+        with mock.patch.object(ffd, "probe_session", return_value=verdict), \
+             mock.patch.object(ffd, "drop_dav_entry"), \
+             mock.patch.object(ffd, "notify_session_problem") as notify:
+            ffd.refresh_session(**kw)
+        return notify
+
+    def test_bad_verdict_notifies_once_per_credential_and_verdict(self):
+        self.assertEqual(self.refresh("pcs").call_count, 1)
+        self.assertEqual(self.refresh("pcs").call_count, 0)  # same credential, same problem
+        self.assertEqual(self.refresh("expired").call_count, 1)  # different problem
+
+    def test_flaky_probe_does_not_rearm_the_notification(self):
+        self.assertEqual(self.refresh("pcs").call_count, 1)
+        self.refresh("unknown")
+        self.assertEqual(self.refresh("pcs").call_count, 0)
+
+    def test_recovery_rearms_the_notification(self):
+        self.refresh("pcs")
+        self.refresh("ok")
+        self.assertEqual(self.refresh("pcs").call_count, 1)
+
+    def test_new_sign_in_rearms_the_notification(self):
+        self.refresh("pcs")
+        self.write_conf("trust-two")
+        self.assertEqual(self.refresh("pcs").call_count, 1)
+
+    def test_good_and_unknown_verdicts_never_notify(self):
+        self.assertEqual(self.refresh("ok").call_count, 0)
+        self.assertEqual(self.refresh("unknown").call_count, 0)
+
+    def test_notify_false_stays_quiet_but_counts_as_told(self):
+        self.assertEqual(self.refresh("pcs", notify=False).call_count, 0)
+        self.assertEqual(self.refresh("pcs").call_count, 0)  # user already saw it in the terminal
+
+    def test_notification_is_fixed_text_run_without_a_shell(self):
+        with mock.patch.object(ffd.Tools, "notify_send", "/usr/bin/notify-send"), \
+             mock.patch.object(ffd, "run_bounded") as run:
+            ffd.notify_session_problem("pcs")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], "/usr/bin/notify-send")
+        self.assertIn("--", argv)  # nothing after it can be parsed as an option
+        body = " ".join(argv)
+        self.assertIn("Terms & Conditions", body)
+        self.assertIn("icloud.com", body)
+        self.assertLess(run.call_args[1]["timeout"], 10)
+
+    def test_notification_tells_expiry_apart_from_the_terms_problem(self):
+        self.assertNotEqual(ffd._SESSION_NOTICES["expired"], ffd._SESSION_NOTICES["pcs"])
+        self.assertNotIn("Terms", " ".join(ffd._SESSION_NOTICES["expired"]))
+
+    def test_missing_notify_send_is_harmless(self):
+        with mock.patch.object(ffd.Tools, "notify_send", ""), \
+             mock.patch.object(ffd, "run_bounded") as run:
+            ffd.notify_session_problem("pcs")
+            run.assert_not_called()
+
+    def test_unknown_state_has_no_notice(self):
+        with mock.patch.object(ffd.Tools, "notify_send", "/usr/bin/notify-send"), \
+             mock.patch.object(ffd, "run_bounded") as run:
+            ffd.notify_session_problem("unknown")
+            ffd.notify_session_problem("ok")
+            run.assert_not_called()
+
+    def test_background_probe_notifies(self):
+        with mock.patch.object(ffd, "probe_session", return_value="expired"), \
+             mock.patch.object(ffd, "drop_dav_entry"), \
+             mock.patch.object(ffd, "notify_session_problem") as notify:
+            ffd.cmd_check_session([])
+        notify.assert_called_once_with("expired")
+
+    def test_start_failure_on_a_bad_session_notifies(self):
+        with mock.patch.object(ffd, "cmd_ensure"), \
+             mock.patch.object(ffd, "probe_session", return_value="pcs"), \
+             mock.patch.object(ffd, "drop_dav_entry"), \
+             mock.patch.object(ffd, "notify_session_problem") as notify, \
+             mock.patch.object(ffd, "systemctl") as systemctl:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_start([])
+        notify.assert_called_once_with("pcs")
+        systemctl.assert_not_called()
+
+    # ---- sign-in terminal ----------------------------------------------
+
+    def run_login(self, states, running, start_side_effect=None):
+        out = io.StringIO()
+        seq = iter(states)
+        with mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd.subprocess, "run"), \
+             mock.patch.object(ffd.time, "sleep") as sleep, \
+             mock.patch.object(ffd, "fresh_session_state", side_effect=lambda **kw: next(seq)) as probe, \
+             mock.patch.object(ffd, "service_running", return_value=running), \
+             mock.patch.object(ffd, "systemctl"), \
+             mock.patch.object(ffd, "wait_for_server"), \
+             mock.patch.object(ffd, "do_mount"), \
+             mock.patch.object(ffd, "ensure_bookmark"), \
+             mock.patch.object(ffd, "cmd_start", side_effect=start_side_effect) as start, \
+             contextlib.redirect_stdout(out):
+            ffd.cmd_login_tui([])
+        return out.getvalue(), start, probe, sleep
+
+    def test_login_starts_the_drive_when_it_was_off(self):
+        text, start, _p, _s = self.run_login(["ok"], running=False)
+        start.assert_called_once()
+        self.assertIn("is on", text)
+
+    def test_login_reports_when_it_cannot_start_the_drive(self):
+        text, _start, _p, _s = self.run_login(["ok"], running=False, start_side_effect=SystemExit(1))
+        self.assertIn("could not start automatically", text)
+
+    def test_login_retries_an_inconclusive_check_then_proceeds(self):
+        text, start, probe, sleep = self.run_login(["unknown", "unknown", "ok"], running=False)
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        start.assert_called_once()
+
+    def test_login_gives_up_retrying_after_a_few_tries(self):
+        _t, start, probe, _s = self.run_login(["unknown"] * 4, running=False)
+        self.assertEqual(probe.call_count, 4)
+        start.assert_called_once()  # offline is not expiry: still try to start
+
+    def test_login_retry_stops_on_a_definite_bad_answer(self):
+        text, start, probe, _s = self.run_login(["unknown", "pcs"], running=False)
+        self.assertEqual(probe.call_count, 2)
+        start.assert_not_called()
+        self.assertIn("Terms", text)
+
+    def test_login_never_notifies_desktop_because_the_terminal_explains(self):
+        _t, _start, probe, _s = self.run_login(["pcs"], running=False)
+        for call in probe.call_args_list:
+            self.assertIs(call.kwargs.get("notify"), False)
+
+    def test_dropping_the_entry_only_unmounts_our_own_uri(self):
+        # The reviewer objected to unmounting the generic loopback WebDAV
+        # URIs (possibly another app's mount). Expiry must not do that.
+        with mock.patch.object(ffd.Tools, "gio", "/usr/bin/gio"), \
+             mock.patch.object(ffd, "run_bounded") as run, \
+             mock.patch.object(ffd, "remove_bookmark") as bookmark, \
+             mock.patch.object(ffd, "unmount_legacy_dav") as legacy, \
+             mock.patch.object(ffd, "unmount_dav") as sweep:
+            ffd.drop_dav_entry()
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0], ["/usr/bin/gio", "mount", "-u", ffd.DAV_URI])
+        bookmark.assert_called_once()
+        legacy.assert_not_called()
+        sweep.assert_not_called()
+
+    def test_check_session_command_is_hidden_and_not_supervisable(self):
+        self.assertIn("__check-session", ffd.COMMANDS)
+        self.assertNotIn("__check-session", ffd.PUBLIC_COMMANDS)
+        self.assertNotIn("__check-session", ffd.SUPERVISABLE_COMMANDS)
+
+    def test_login_restarts_a_running_server_with_the_new_session(self):
+        calls = []
+        with mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd.subprocess, "run"), \
+             mock.patch.object(ffd, "fresh_session_state", return_value="ok"), \
+             mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "systemctl", side_effect=lambda *a, **k: calls.append(a[0])), \
+             mock.patch.object(ffd, "wait_for_server", side_effect=lambda: calls.append("ready")), \
+             mock.patch.object(ffd, "do_mount", side_effect=lambda: calls.append("mount")), \
+             mock.patch.object(ffd, "ensure_bookmark", side_effect=lambda: calls.append("bookmark")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            ffd.cmd_login_tui([])
+        self.assertEqual(calls, ["restart", "ready", "mount", "bookmark"])
+
+    def test_login_that_iCloud_still_rejects_does_not_restart_anything(self):
+        with mock.patch.object(ffd, "remote_configured", return_value=True), \
+             mock.patch.object(ffd.subprocess, "run"), \
+             mock.patch.object(ffd, "fresh_session_state", return_value="expired"), \
+             mock.patch.object(ffd, "service_running", return_value=True), \
+             mock.patch.object(ffd, "systemctl") as systemctl, \
+             contextlib.redirect_stdout(io.StringIO()):
+            ffd.cmd_login_tui([])
+        systemctl.assert_not_called()
 
 
 class SuperviseGuardTests(unittest.TestCase):

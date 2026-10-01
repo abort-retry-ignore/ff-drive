@@ -552,6 +552,7 @@ class Tools:
     omarchy = ""
     xdg_terminal = ""
     rclone = ""
+    notify_send = ""
 
 
 def resolve_tools() -> None:
@@ -562,6 +563,7 @@ def resolve_tools() -> None:
     Tools.omarchy = find_verified("omarchy") or ""
     Tools.xdg_terminal = find_verified("xdg-terminal-exec") or ""
     Tools.rclone = find_verified("rclone") or ""
+    Tools.notify_send = find_verified("notify-send") or ""
 
 
 # =======================================================================
@@ -807,31 +809,253 @@ def remote_configured() -> bool:
     return REMOTE_NAME in names
 
 
-def session_present() -> bool:
+def _read_session() -> "tuple[str, str] | None":
+    """(trust_token, cookies) from rclone's config, or None if there is no
+    readable icloud remote. Presence only: this says nothing about validity."""
     import configparser
 
     d = open_state_dir(rel_to_home(RCLONE_CONF_DIR))
     if d is None:
-        return False
+        return None
     try:
         try:
             data = d.read_bounded("rclone.conf", 1_048_576, missing_ok=True)
         except Unsafe:
-            return False
+            return None
         if data is None:
-            return False
+            return None
         parser = configparser.ConfigParser()
         try:
             parser.read_string(data.decode("utf-8", "replace"))
         except configparser.Error:
-            return False
+            return None
         if not parser.has_section(REMOTE_NAME):
-            return False
-        token = parser.get(REMOTE_NAME, "trust_token", fallback="").strip()
-        cookies = parser.get(REMOTE_NAME, "cookies", fallback="").strip()
-        return bool(token or cookies)
+            return None
+        return (parser.get(REMOTE_NAME, "trust_token", fallback="").strip(),
+                parser.get(REMOTE_NAME, "cookies", fallback="").strip())
     finally:
         d.close()
+
+
+def session_present() -> bool:
+    session = _read_session()
+    return bool(session and (session[0] or session[1]))
+
+
+def session_fingerprint() -> str:
+    """Identifies the credential a probe result belongs to, so a new sign-in
+    invalidates the cached verdict by itself. Only the long-lived trust token
+    is used (cookies are rewritten by rclone as it runs); never the secret."""
+    session = _read_session()
+    if not session or not (session[0] or session[1]):
+        return ""
+    return hashlib.sha256((session[0] or session[1]).encode("utf-8", "replace")).hexdigest()
+
+
+# -----------------------------------------------------------------------
+# Session *validity*
+#
+# A trust token being present in rclone.conf says nothing about whether
+# iCloud still honours it (it lapses after ~30 days). rclone only finds out
+# when it calls iCloud, and then the local WebDAV server answers 207 with a
+# truncated body, which GVFS reports as a failed mount and Nautilus turns
+# into a bogus password prompt. So validity is probed against iCloud itself.
+# -----------------------------------------------------------------------
+
+SESSION_CHECK_FILE = "session-check"
+SESSION_OK_TTL = 600.0       # re-verify a good session this often (while running)
+SESSION_BAD_TTL = 120.0      # re-verify an expired/unknown verdict this often
+SESSION_PENDING_TTL = 60.0   # a background probe is assumed dead after this
+SESSION_PROBE_TIMEOUT = 25.0
+SESSION_EXPIRED_MESSAGE = "iCloud session expired \u2014 use Sign in on the widget"
+SESSION_PCS_MESSAGE = ("iCloud sign-in incomplete \u2014 open icloud.com in a browser and accept any "
+                       "Terms & Conditions, then use Sign in again")
+# Verdicts that mean "the stored login cannot reach iCloud Drive":
+#   expired - iCloud rejected the session (trust token lapsed, ~30 days)
+#   pcs     - signed in, but Apple withheld the web session cookies
+#             (X-APPLE-WEBAUTH-TOKEN). Known causes: iCloud Terms & Conditions
+#             not yet accepted at icloud.com, or "Access iCloud Data on the
+#             Web" switched off (Advanced Data Protection). rclone issue #9658.
+BAD_SESSION_STATES = ("expired", "pcs")
+_SESSION_PCS_RE = re.compile(
+    r"requestpcs|missing (?:x-apple-webauth-token|pcs cookies)", re.IGNORECASE)
+_SESSION_EXPIRED_RE = re.compile(
+    r"invalid global session|http error (?:401|403|421)\b|requires? 2fa|two-factor|"
+    r"authentication (?:failed|required)|trust token|config reconnect",
+    re.IGNORECASE,
+)
+
+
+def probe_session() -> str:
+    """Ask iCloud, via rclone, whether the stored session still works.
+
+    Returns "ok", "expired" (iCloud rejected it), "pcs" (signed in but no
+    web-access cookies were issued) or "unknown" (offline, timeout, anything
+    that is not clearly an auth problem)."""
+    if not Tools.rclone:
+        return "unknown"
+    result = run_bounded(
+        [Tools.rclone, "lsd", REMOTE,
+         "--retries", "1", "--low-level-retries", "1",
+         "--contimeout", "8s", "--timeout", "12s"],
+        timeout=SESSION_PROBE_TIMEOUT,
+    )
+    if result.timed_out or result.overflowed:
+        return "unknown"
+    if result.returncode == 0:
+        return "ok"
+    text = (result.stderr + b"\n" + result.stdout).decode("utf-8", "replace")
+    if _SESSION_PCS_RE.search(text):
+        return "pcs"
+    return "expired" if _SESSION_EXPIRED_RE.search(text) else "unknown"
+
+
+def _load_session_check() -> dict:
+    d = open_state_dir(rel_to_home(CONFIG_DIR))
+    if d is None:
+        return {}
+    try:
+        try:
+            data = d.read_bounded(SESSION_CHECK_FILE, 4096, missing_ok=True)
+        except (Unsafe, OSError):
+            return {}
+        if not data:
+            return {}
+        try:
+            record = json.loads(data)
+        except ValueError:
+            return {}
+        return record if isinstance(record, dict) else {}
+    finally:
+        d.close()
+
+
+def _store_session_check(record: dict) -> None:
+    d = open_state_dir(rel_to_home(CONFIG_DIR))
+    if d is None:
+        return
+    try:
+        d.atomic_write(SESSION_CHECK_FILE, json.dumps(record).encode("utf-8"))
+    except (Unsafe, OSError):
+        pass
+    finally:
+        d.close()
+
+
+def drop_dav_entry() -> None:
+    """Take the mount and the sidebar bookmark away: with a dead session
+    every click on them only produces a password prompt for a credential the
+    user never has."""
+    try:
+        # Only our own URI. unmount_dav() also sweeps the generic legacy
+        # loopback URIs, which could be someone else's WebDAV volume; that
+        # sweep belongs to removal of the plugin, not to a routine expiry.
+        if Tools.gio:
+            run_bounded([Tools.gio, "mount", "-u", DAV_URI], timeout=5)
+        remove_bookmark()
+    except (Unsafe, OSError):
+        pass
+
+
+# Fixed texts only (nothing from rclone or Apple is ever put in a notification).
+_SESSION_NOTICES = {
+    "expired": (
+        "iCloud session expired",
+        "Choose Reconnect iCloud in the Fast Fruit Drive panel and sign in with your Apple ID and 2FA.",
+    ),
+    "pcs": (
+        "iCloud sign-in incomplete",
+        "Apple is not giving this sign-in access to iCloud Drive. Open icloud.com in a browser and "
+        "accept any Terms & Conditions, then choose Reconnect iCloud in the Fast Fruit Drive panel.",
+    ),
+}
+
+
+def notify_session_problem(state: str) -> None:
+    notice = _SESSION_NOTICES.get(state)
+    if not notice or not Tools.notify_send:
+        return
+    run_bounded(
+        [Tools.notify_send, "--app-name=Fast Fruit Drive", "--urgency=normal",
+         "--icon=dialog-warning", "--", notice[0], notice[1]],
+        timeout=5,
+    )
+
+
+def refresh_session(*, notify: bool = True) -> str:
+    """Probe now, remember the verdict, and on a bad one remove the DAV entry
+    and tell the user, once per (credential, verdict)."""
+    previous = _load_session_check()
+    state = probe_session()
+    fingerprint = session_fingerprint()
+    same = previous.get("fp") == fingerprint
+    record = {"fp": fingerprint, "result": state, "checked": int(time.time())}
+    already_told = same and previous.get("notified") == state
+    if state in BAD_SESSION_STATES:
+        record["notified"] = state
+    elif state == "unknown" and same and previous.get("notified"):
+        # A flaky probe must not make the next bad verdict notify again.
+        record["notified"] = previous["notified"]
+    _store_session_check(record)
+    if state in BAD_SESSION_STATES:
+        drop_dav_entry()
+        if notify and not already_told:
+            notify_session_problem(state)
+    return state
+
+
+def fresh_session_state(*, notify: bool = True) -> str:
+    """"missing" | "expired" | "pcs" | "ok" | "unknown", from a live probe."""
+    if not session_present():
+        return "missing"
+    return refresh_session(notify=notify)
+
+
+def require_valid_session() -> None:
+    state = fresh_session_state()
+    if state == "missing":
+        fail("iCloud session missing \u2014 use Sign in on the widget")
+    if state == "expired":
+        fail(SESSION_EXPIRED_MESSAGE)
+    if state == "pcs":
+        fail(SESSION_PCS_MESSAGE)
+
+
+def cached_session_state(*, allow_probe: bool) -> str:
+    """"ok" | "expired" | "pcs" | "unknown" without ever touching the network.
+
+    Used by `status`, which runs every few seconds under a hard deadline. A
+    stale verdict triggers a detached background probe (at most one at a
+    time) instead of blocking; the next status call sees its result."""
+    fingerprint = session_fingerprint()
+    if not fingerprint:
+        return "unknown"
+    record = _load_session_check()
+    same = record.get("fp") == fingerprint
+    result = record.get("result") if same else "unknown"
+    if result not in ("ok",) + BAD_SESSION_STATES:
+        result = "unknown"
+    checked = record.get("checked") if same else 0
+    now = time.time()
+    if not isinstance(checked, (int, float)) or checked > now:
+        checked = 0
+    stale = now - checked >= (SESSION_OK_TTL if result == "ok" else SESSION_BAD_TTL)
+    if not (stale and allow_probe and Tools.python3):
+        return result
+    pending = record.get("pending")
+    if isinstance(pending, (int, float)) and 0 <= now - pending < SESSION_PENDING_TTL:
+        return result
+    marker = dict(record) if same else {}
+    marker.update({"fp": fingerprint, "pending": int(now)})
+    _store_session_check(marker)
+    spawn_detached([Tools.python3, "-I", SELF_PATH, "__check-session"])
+    return result
+
+
+def cmd_check_session(_args) -> None:
+    """Hidden: refresh the cached session verdict (spawned by `status`)."""
+    if session_present():
+        refresh_session()
 
 
 # =======================================================================
@@ -1313,6 +1537,10 @@ def rewrite_bookmarks(append: "str | None") -> None:
 
 
 def ensure_bookmark() -> None:
+    # With a known-bad login every click on the entry can only end in a
+    # password prompt (or a dead link), so never put it in the sidebar.
+    if cached_session_state(allow_probe=False) in BAD_SESSION_STATES:
+        return
     rewrite_bookmarks(f"{DAV_URI} {DISPLAY_NAME}")
 
 
@@ -1667,8 +1895,7 @@ def cmd_start(_args) -> None:
     cmd_ensure(_args)
     if not remote_configured():
         fail(f"rclone remote '{REMOTE}' is not configured \u2014 use Sign in on the widget")
-    if not session_present():
-        fail("iCloud session missing or expired \u2014 use Sign in on the widget")
+    require_valid_session()
     systemctl("start", UNIT_NAME)
     if not service_running():
         fail(f"service failed to start \u2014 see: journalctl --user -u {UNIT_NAME}")
@@ -1699,6 +1926,7 @@ def _guard_no_dirty(action: str) -> bool:
 
 def cmd_restart(_args) -> None:
     cmd_ensure(_args)
+    require_valid_session()
     systemctl("restart", UNIT_NAME)
     wait_for_server()
     do_mount()
@@ -1714,6 +1942,12 @@ def cmd_toggle(args) -> None:
 
 def cmd_open(_args) -> None:
     load_config()
+    if fresh_session_state() in ("missing",) + BAD_SESSION_STATES:
+        # Nothing useful to show in Nautilus: it would only offer a password
+        # prompt. Take the user straight to the sign-in instead.
+        print(f"{APP}: iCloud sign-in needed \u2014 opening the sign-in terminal", file=sys.stderr)
+        cmd_login(_args)
+        return
     if Tools.omarchy:
         spawn_detached([Tools.omarchy, "launch", "nautilus"])
     elif Tools.nautilus:
@@ -1739,6 +1973,7 @@ def cmd_mount(_args) -> None:
     """
     if not service_running():
         fail("Fast Fruit Drive is not running \u2014 toggle it on from the bar")
+    require_valid_session()
     wait_for_server()
     do_mount()
     ensure_bookmark()
@@ -1778,7 +2013,63 @@ def cmd_login_tui(_args) -> None:
         print()
         subprocess.run([Tools.rclone, "config"], env=sanitized_child_env())
     print()
-    print("Done. You can close this terminal. Toggle Fast Fruit Drive on from the bar.")
+    print("Checking the new session with iCloud...")
+    # Apple can still be issuing cookies right after sign-in, so an
+    # inconclusive probe ("unknown") is retried before giving up on it. The
+    # terminal explains any problem itself, so no desktop notification here.
+    state = fresh_session_state(notify=False)
+    for _ in range(3):
+        if state != "unknown":
+            break
+        time.sleep(3)
+        state = fresh_session_state(notify=False)
+    if state == "pcs":
+        print("Apple signed you in but did not issue the cookies iCloud Drive needs")
+        print("(rclone: 'Missing X-APPLE-WEBAUTH-TOKEN cookie', rclone issue #9658).")
+        print("Known causes, most common first:")
+        print()
+        print("  1. iCloud Terms & Conditions are waiting for you. Open https://www.icloud.com")
+        print("     in a browser, sign in, and click Agree on any Terms dialog.")
+        print("  2. 'Access iCloud Data on the Web' is off (Settings > Apple Account > iCloud on")
+        print("     your iPhone; Advanced Data Protection turns it off).")
+        print("  3. A trusted-device prompt was not approved while signing in.")
+        print()
+        print("Then run Sign in again from the widget.")
+        print()
+        print("If it keeps failing, clear 'cookies' and 'trust_token' from the [icloud]")
+        print("section of ~/.config/rclone/rclone.conf, then Sign in again.")
+        print()
+        return
+    if state in ("expired", "missing"):
+        print("iCloud still rejects the session. Close this window and use Sign in again.")
+        print()
+        return
+    if service_running():
+        # The running server holds the old session in memory: restart it so
+        # it picks up the new token, then restore the Nautilus mount.
+        print("Restarting the WebDAV service with the new session...")
+        try:
+            systemctl("restart", UNIT_NAME)
+            wait_for_server()
+            do_mount()
+            ensure_bookmark()
+        except SystemExit:
+            print("Could not restart automatically; toggle Fast Fruit Drive off and on from the bar.")
+            print()
+            return
+        print()
+        print("Done. You can close this terminal.")
+    else:
+        # Signing in is a request to use the drive: turn it on and mount it.
+        print("Starting Fast Fruit Drive...")
+        try:
+            cmd_start([])
+        except SystemExit:
+            print("Signed in, but it could not start automatically; toggle Fast Fruit Drive on from the bar.")
+            print()
+            return
+        print()
+        print("Done. Fast Fruit Drive is on. You can close this terminal.")
     print()
 
 
@@ -1913,16 +2204,24 @@ def cmd_status(_args) -> None:
     configured = rclone_found and remote_configured()
     has_session = configured and session_present()
     running = service_running()
+    # Presence of a token is not validity: ask the (cached, background-probed)
+    # verdict about whether iCloud still accepts it.
+    problem = cached_session_state(allow_probe=running) if has_session else "unknown"
+    expired = problem in BAD_SESSION_STATES
     mounted = gio_mounted()
     gvfs = os.path.isfile("/usr/lib/gvfsd-dav") and os.access("/usr/lib/gvfsd-dav", os.X_OK)
     used = cache_bytes()
 
-    ready = rclone_found and configured and has_session and gvfs
-    needs_login = rclone_found and (not configured or not has_session)
+    ready = rclone_found and configured and has_session and not expired and gvfs
+    needs_login = rclone_found and (not configured or not has_session or expired)
 
     status_text = "Stopped"
     if not rclone_found:
         status_text = "rclone not found"
+    elif problem == "pcs":
+        status_text = "iCloud sign-in incomplete"
+    elif expired:
+        status_text = "iCloud session expired"
     elif needs_login:
         status_text = "Sign in to iCloud"
     elif not gvfs:
@@ -1938,6 +2237,8 @@ def cmd_status(_args) -> None:
         "rcloneFound": rclone_found,
         "remoteConfigured": configured,
         "hasSession": has_session,
+        "sessionExpired": expired,
+        "sessionProblem": problem if expired else "",
         "needsLogin": needs_login,
         "gvfsDav": gvfs,
         "cacheUsedBytes": used,
@@ -2028,6 +2329,7 @@ COMMANDS = {
     "clear-cache": cmd_clear_cache,
     "uninstall": cmd_uninstall,
     "__migrate-lifecycle": cmd_migrate_lifecycle,
+    "__check-session": cmd_check_session,
     "help": cmd_help,
 }
 

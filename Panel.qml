@@ -239,6 +239,8 @@ Panel {
             wrapMode: Text.WordWrap
             function setupText() {
               if (!drive.rcloneFound) return "Install rclone: omarchy pkg add rclone"
+              if (drive.sessionProblem === "pcs") return "Apple signed in but withheld iCloud Drive web access. Open icloud.com in a browser and accept any Terms & Conditions, check that Access iCloud Data on the Web is on, then sign in again."
+              if (drive.sessionExpired) return "Your iCloud session expired (rclone's trust token lasts about 30 days). Sign in again with your Apple ID password and 2FA. App-specific passwords are not accepted."
               if (drive.needsLogin) return "Sign in with your Apple ID password and 2FA. rclone keeps a trust token for about 30 days, then you sign in again. App-specific passwords are not accepted."
               if (!drive.gvfsDav) return "Install gvfs-dnssd so Nautilus can speak WebDAV."
               return "Fast Fruit Drive is not ready yet."

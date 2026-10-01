@@ -20,6 +20,8 @@ function defaultStatus(error) {
     rcloneFound: false,
     remoteConfigured: false,
     hasSession: false,
+    sessionExpired: false,
+    sessionProblem: "",
     needsLogin: false,
     gvfsDav: false,
     cacheUsedBytes: 0,
