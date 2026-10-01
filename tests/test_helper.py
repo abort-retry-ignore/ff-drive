@@ -883,6 +883,42 @@ class ServeArgumentsTests(SandboxedHome):
         self.assertEqual(addrs, ["127.0.0.1:8080", "[::1]:8080"])
 
 
+class ConfigureBookmarkTests(SandboxedHome):
+    """The widget runs `configure` every time it loads, to apply its settings.
+    That must not put an "iCloud Drive" bookmark in Nautilus for a drive that
+    is not running (found by uninstalling and reinstalling the plugin)."""
+
+    ARGS = ["cache_max_size=4G", "cache_max_age_hours=24", "restart=1"]
+
+    def run_configure(self, running, args=None):
+        with mock.patch.object(ffd, "service_running", return_value=running), \
+             mock.patch.object(ffd, "ensure_bookmark") as bookmark, \
+             mock.patch.object(ffd, "cmd_restart") as restart:
+            ffd.cmd_configure(args or self.ARGS)
+        return bookmark, restart
+
+    def test_stopped_drive_gets_no_bookmark_at_widget_load(self):
+        bookmark, restart = self.run_configure(running=False)
+        bookmark.assert_not_called()
+        restart.assert_not_called()
+
+    def test_running_drive_keeps_its_bookmark(self):
+        bookmark, restart = self.run_configure(running=True)  # defaults: nothing changed
+        bookmark.assert_called_once()
+        restart.assert_not_called()
+
+    def test_changed_setting_on_a_running_drive_restarts_it(self):
+        bookmark, restart = self.run_configure(running=True, args=["cache_max_size=8G", "restart=1"])
+        restart.assert_called_once()
+        bookmark.assert_not_called()  # cmd_restart owns the bookmark
+
+    def test_changed_setting_on_a_stopped_drive_is_saved_without_side_effects(self):
+        bookmark, restart = self.run_configure(running=False, args=["cache_max_size=8G", "restart=1"])
+        bookmark.assert_not_called()
+        restart.assert_not_called()
+        self.assertEqual(ffd.load_config().cache_max_size, "8G")
+
+
 class SuperviseGuardTests(unittest.TestCase):
     def test_serve_and_login_tui_are_not_supervisable(self):
         self.assertNotIn("serve", ffd.SUPERVISABLE_COMMANDS)

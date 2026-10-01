@@ -2099,10 +2099,14 @@ def cmd_configure(args) -> None:
         else:
             fail(f"unknown configure key: {key}")
     save_config(cfg)
-    if restart and changed and service_running():
+    running = service_running()
+    if restart and changed and running:
         cmd_restart(args)
-    else:
+    elif running:
         ensure_bookmark()
+    # A stopped drive gets no bookmark: the widget runs `configure` on every
+    # load to apply its settings, and a sidebar entry for a server that is not
+    # there is a dead link.
 
 
 def cmd_clear_cache(_args) -> None:
