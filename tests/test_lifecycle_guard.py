@@ -121,6 +121,77 @@ class LifecycleDecisionTests(SandboxedGuardHome):
         finally:
             guard.query_plugin_enabled = old_query
 
+    # The query itself, not just the decision made from its answer. The tests
+    # above replace query_plugin_enabled wholesale, which hid that the real
+    # call ran with a closed environment and made omarchy-shell exit with
+    # "OMARCHY_PATH is not set": a plain disable then never disarmed anything.
+
+    def test_query_passes_omarchy_path_to_the_shell_command(self):
+        seen = {}
+
+        def fake_run_tool(path, args, **kw):
+            seen.update(path=path, args=args, env_extra=kw.get("env_extra"))
+            return guard.Result(0, b'[{"id": "%s", "enabled": false}]' % guard.PLUGIN_ID.encode(), b"")
+
+        old_tool, old_root = guard.run_tool, guard.omarchy_path
+        guard.run_tool, guard.omarchy_path = fake_run_tool, lambda: "/usr/share/omarchy"
+        try:
+            self.assertIs(guard.query_plugin_enabled(), False)
+        finally:
+            guard.run_tool, guard.omarchy_path = old_tool, old_root
+        self.assertEqual(seen["path"], guard.OMARCHY_SHELL)
+        self.assertEqual(seen["env_extra"], {"OMARCHY_PATH": "/usr/share/omarchy"})
+
+    def test_environment_stays_closed_apart_from_that_one_call(self):
+        os.environ["OMARCHY_PATH"] = "/usr/share/omarchy"
+        try:
+            self.assertNotIn("OMARCHY_PATH", guard.child_env())
+        finally:
+            del os.environ["OMARCHY_PATH"]
+
+    def test_run_bounded_merges_only_the_requested_extra_environment(self):
+        result = guard.run_bounded(["/usr/bin/env"], timeout=5, env_extra={"OMARCHY_PATH": "/x"})
+        lines = result.stdout.decode().splitlines()
+        self.assertIn("OMARCHY_PATH=/x", lines)
+        self.assertIn("PATH=/usr/bin", lines)
+        plain = guard.run_bounded(["/usr/bin/env"], timeout=5).stdout.decode().splitlines()
+        self.assertFalse(any(line.startswith("OMARCHY_PATH=") for line in plain))
+
+    def test_no_trustworthy_omarchy_root_means_do_nothing(self):
+        old_root = guard.omarchy_path
+        guard.omarchy_path = lambda: None
+        try:
+            self.assertIsNone(guard.query_plugin_enabled())  # -> lifecycle "none": never disarm on doubt
+        finally:
+            guard.omarchy_path = old_root
+
+    def test_omarchy_path_rejects_an_inherited_value_that_is_not_root_owned(self):
+        evil = os.path.join(self.tmp, "fake-omarchy")
+        os.makedirs(os.path.join(evil, "shell"))
+        with open(os.path.join(evil, "shell", "shell.qml"), "w") as fh:
+            fh.write("// planted\n")
+        os.environ["OMARCHY_PATH"] = evil
+        try:
+            chosen = guard.omarchy_path()
+        finally:
+            del os.environ["OMARCHY_PATH"]
+        self.assertNotEqual(chosen, evil)  # user-owned tree: never handed to omarchy-shell
+        self.assertIn(chosen, (None, guard.OMARCHY_ROOT_DEFAULT))
+
+    def test_omarchy_path_rejects_traversal_and_relative_values(self):
+        for bad in ("relative/path", "/usr/share/../../tmp"):
+            os.environ["OMARCHY_PATH"] = bad
+            try:
+                self.assertNotEqual(guard.omarchy_path(), bad)
+            finally:
+                del os.environ["OMARCHY_PATH"]
+
+    def test_omarchy_path_falls_back_to_the_packaged_default_when_present(self):
+        if not os.path.isfile(os.path.join(guard.OMARCHY_ROOT_DEFAULT, "shell", "shell.qml")):
+            self.skipTest("Omarchy is not installed in the packaged location")
+        os.environ.pop("OMARCHY_PATH", None)
+        self.assertEqual(guard.omarchy_path(), guard.OMARCHY_ROOT_DEFAULT)
+
     def test_invalid_serve_disarms_and_exits_successfully(self):
         calls = []
         old_disarm, old_schedule = guard.disarm_unit, guard.schedule_cleanup

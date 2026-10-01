@@ -58,6 +58,10 @@ SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 GIO = "/usr/bin/gio"
 OMARCHY_SHELL = "/usr/bin/omarchy-shell"
+# omarchy-shell refuses to run without OMARCHY_PATH (the install root that
+# holds shell/shell.qml). The guard's environment is closed, so it is passed
+# explicitly and only for that one call; see omarchy_path().
+OMARCHY_ROOT_DEFAULT = "/usr/share/omarchy"
 
 MANIFEST_CAP = 64 * 1024
 HELPER_CAP = 2 * 1024 * 1024
@@ -418,12 +422,16 @@ def _kill_group(proc: subprocess.Popen[bytes], force: bool) -> None:
         pass
 
 
-def run_bounded(argv: list[str], *, timeout: float, cap: int = OUTPUT_CAP) -> Result:
+def run_bounded(argv: list[str], *, timeout: float, cap: int = OUTPUT_CAP,
+                env_extra: "dict[str, str] | None" = None) -> Result:
     """Run a verified fixed command with raw-byte caps and group cleanup."""
+    env = child_env()
+    if env_extra:
+        env.update(env_extra)
     try:
         proc = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=child_env(), close_fds=True, start_new_session=True,
+            env=env, close_fds=True, start_new_session=True,
         )
     except OSError as exc:
         return Result(127, b"", str(exc).encode("utf-8", "replace"))
@@ -476,11 +484,12 @@ def run_bounded(argv: list[str], *, timeout: float, cap: int = OUTPUT_CAP) -> Re
     return Result(proc.returncode or 0, bytes(out), bytes(err), timed_out=timed_out, overflowed=overflowed)
 
 
-def run_tool(path: str, args: list[str], *, timeout: float = 10, cap: int = OUTPUT_CAP) -> Result:
+def run_tool(path: str, args: list[str], *, timeout: float = 10, cap: int = OUTPUT_CAP,
+             env_extra: "dict[str, str] | None" = None) -> Result:
     tool = verified_usr_tool(path)
     if not tool:
         return Result(127, b"", b"verified system tool unavailable")
-    return run_bounded([tool, *args], timeout=timeout, cap=cap)
+    return run_bounded([tool, *args], timeout=timeout, cap=cap, env_extra=env_extra)
 
 
 # ---------------------------------------------------------------------------
@@ -819,8 +828,36 @@ def cmd_serve() -> int:
             pass
 
 
+def omarchy_path() -> "str | None":
+    """The Omarchy install root to hand to omarchy-shell, or None.
+
+    The value is not trusted just because it is in the environment: it must be
+    an absolute path with no ".." whose whole ancestry, down to the directory
+    holding the shell config, is root-owned and not group/world-writable, and
+    which really contains shell/shell.qml. The inherited OMARCHY_PATH is
+    preferred (it is what the running shell uses); otherwise the packaged
+    default. Anything else yields None, which makes the caller do nothing."""
+    candidates = []
+    inherited = os.environ.get("OMARCHY_PATH", "")
+    if inherited:
+        candidates.append(inherited)
+    candidates.append(OMARCHY_ROOT_DEFAULT)
+    for candidate in candidates:
+        if not candidate.startswith("/") or ".." in candidate.split("/") or "\x00" in candidate:
+            continue
+        candidate = candidate.rstrip("/") or "/"
+        shell_dir = os.path.join(candidate, "shell")
+        if _safe_root_ancestors(shell_dir) and os.path.isfile(os.path.join(shell_dir, "shell.qml")):
+            return candidate
+    return None
+
+
 def query_plugin_enabled() -> bool | None:
-    result = run_tool(OMARCHY_SHELL, ["shell", "listPlugins"], timeout=8)
+    root = omarchy_path()
+    if root is None:
+        return None
+    result = run_tool(OMARCHY_SHELL, ["shell", "listPlugins"], timeout=8,
+                      env_extra={"OMARCHY_PATH": root})
     if not result.ok:
         return None
     try:

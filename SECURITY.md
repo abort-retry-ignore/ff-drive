@@ -175,6 +175,17 @@ or `rclone.conf`; preserving a possible `Dirty: true` cache is safer than
 losing an upload. The explicit `uninstall` command remains the only full state
 purge and retains its pending-upload refusal.
 
+A plain disable (checkout still present) is recognised by asking the shell
+whether the plugin is enabled, through the verified `/usr/bin/omarchy-shell`.
+That command refuses to run without `OMARCHY_PATH`, which the guard's closed
+environment does not carry, so the guard passes it explicitly for that single
+call. The value is not taken on trust: it must be an absolute path without
+`..` whose ancestry down to `shell/` is root-owned and not group/world
+writable, and which contains `shell/shell.qml`. The inherited value is
+preferred, then the packaged `/usr/share/omarchy`; if neither qualifies, or
+the shell cannot be asked, the guard does nothing (an unanswerable question
+never disarms anything).
+
 ### Ownership of shared registrations
 
 The three systemd user units (`fast-fruit-drive.service`,
