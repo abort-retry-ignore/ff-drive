@@ -554,6 +554,7 @@ class Tools:
     xdg_terminal = ""
     rclone = ""
     notify_send = ""
+    uwsm_app = ""
 
 
 def resolve_tools() -> None:
@@ -565,6 +566,7 @@ def resolve_tools() -> None:
     Tools.xdg_terminal = find_verified("xdg-terminal-exec") or ""
     Tools.rclone = find_verified("rclone") or ""
     Tools.notify_send = find_verified("notify-send") or ""
+    Tools.uwsm_app = find_verified("uwsm-app") or ""
 
 
 # =======================================================================
@@ -1953,17 +1955,31 @@ def cmd_open(_args) -> None:
         print(f"{APP}: iCloud sign-in needed \u2014 opening the sign-in terminal", file=sys.stderr)
         cmd_login(_args)
         return
-    if Tools.omarchy:
-        spawn_detached([Tools.omarchy, "launch", "nautilus"])
-    elif Tools.nautilus:
-        spawn_detached([Tools.nautilus, "--new-window"])
+    # Bring the drive up and mount it *first*, then point Nautilus at it: an
+    # unmounted dav:// location would make Nautilus mount it itself and ask
+    # for the local WebDAV password. If this fails, no window is opened.
+    if service_running():
+        do_mount()
+        ensure_bookmark()
     else:
-        fail("nautilus not found")
-    if not service_running():
         cmd_start(_args)
-        return
-    do_mount()
-    ensure_bookmark()
+    open_in_file_manager(DAV_URI)
+
+
+def open_in_file_manager(uri: str) -> None:
+    """Open URI in a new Nautilus window.
+
+    `omarchy launch nautilus` cannot be used: it is a fixed
+    `uwsm-app -- nautilus --new-window` that ignores arguments, so it always
+    opens Home. This is the same command with the location added, through
+    uwsm-app when present so the window gets the session's app scope.
+    """
+    if not Tools.nautilus:
+        fail("nautilus not found")
+    argv = [Tools.nautilus, "--new-window", uri]
+    if Tools.uwsm_app:
+        argv = [Tools.uwsm_app, "--", *argv]
+    spawn_detached(argv)
 
 
 def cmd_mount(_args) -> None:

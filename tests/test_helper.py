@@ -825,6 +825,50 @@ class SessionValidityTests(SandboxedHome):
         legacy.assert_not_called()
         sweep.assert_not_called()
 
+    # ---- "Open in Nautilus" ------------------------------------------------
+
+    def run_open(self, running, mount_error=None, uwsm="/usr/bin/uwsm-app"):
+        calls = []
+        with mock.patch.object(ffd, "refresh_session", return_value="ok"), \
+             mock.patch.object(ffd, "service_running", return_value=running), \
+             mock.patch.object(ffd.Tools, "nautilus", "/usr/bin/nautilus"), \
+             mock.patch.object(ffd.Tools, "uwsm_app", uwsm), \
+             mock.patch.object(ffd, "do_mount", side_effect=mount_error or (lambda: calls.append("mount"))), \
+             mock.patch.object(ffd, "ensure_bookmark", side_effect=lambda: calls.append("bookmark")), \
+             mock.patch.object(ffd, "cmd_start", side_effect=lambda _a: calls.append("start")), \
+             mock.patch.object(ffd, "spawn_detached", side_effect=lambda argv, **kw: calls.append(("spawn", argv))):
+            try:
+                ffd.cmd_open([])
+            except SystemExit:
+                calls.append("exit")
+        return calls
+
+    def test_open_points_nautilus_at_the_drive_not_at_home(self):
+        calls = self.run_open(running=True)
+        spawn = [c for c in calls if isinstance(c, tuple)][0][1]
+        self.assertEqual(spawn, ["/usr/bin/uwsm-app", "--", "/usr/bin/nautilus", "--new-window", ffd.DAV_URI])
+
+    def test_open_mounts_before_it_opens_the_window(self):
+        calls = self.run_open(running=True)
+        self.assertEqual([c if isinstance(c, str) else "spawn" for c in calls], ["mount", "bookmark", "spawn"])
+
+    def test_open_on_a_stopped_drive_starts_it_first(self):
+        calls = self.run_open(running=False)
+        self.assertEqual([c if isinstance(c, str) else "spawn" for c in calls], ["start", "spawn"])
+
+    def test_open_opens_no_window_if_the_mount_fails(self):
+        calls = self.run_open(running=True, mount_error=SystemExit(1))
+        self.assertNotIn("spawn", [c if isinstance(c, str) else "spawn" for c in calls])  # no password-prompt window
+        self.assertIn("exit", calls)
+
+    def test_open_works_without_uwsm_app(self):
+        calls = self.run_open(running=True, uwsm="")
+        spawn = [c for c in calls if isinstance(c, tuple)][0][1]
+        self.assertEqual(spawn, ["/usr/bin/nautilus", "--new-window", ffd.DAV_URI])
+
+    def test_the_location_is_never_mistaken_for_an_option(self):
+        self.assertTrue(ffd.DAV_URI.startswith("dav://"))
+
     def test_check_session_command_is_hidden_and_not_supervisable(self):
         self.assertIn("__check-session", ffd.COMMANDS)
         self.assertNotIn("__check-session", ffd.PUBLIC_COMMANDS)
