@@ -919,6 +919,83 @@ class ConfigureBookmarkTests(SandboxedHome):
         self.assertEqual(ffd.load_config().cache_max_size, "8G")
 
 
+class LoginWindowTests(unittest.TestCase):
+    """The sign-in terminal closes the moment its process exits, which hid the
+    messages that explain what to do. It must stay readable (found when a real
+    sign-in finished and the window vanished)."""
+
+    def fake_tty(self, tty=True):
+        fake = mock.Mock()
+        fake.isatty.return_value = tty
+        return fake
+
+    def test_never_waits_without_a_terminal(self):
+        with mock.patch.object(ffd.sys, "stdin", self.fake_tty(False)), \
+             mock.patch.object(ffd.sys, "stdout", self.fake_tty(False)), \
+             mock.patch.object(ffd.select, "select") as sel:
+            ffd.wait_before_closing(None)
+        sel.assert_not_called()
+
+    def test_waits_for_enter_on_a_terminal(self):
+        stdin = self.fake_tty()
+        with mock.patch.object(ffd.sys, "stdin", stdin), \
+             mock.patch.object(ffd.sys, "stdout", self.fake_tty()), \
+             mock.patch.object(ffd.select, "select", return_value=([stdin], [], [])) as sel:
+            ffd.wait_before_closing(None)
+        self.assertIsNone(sel.call_args[0][3])  # no timeout: wait for Enter
+        stdin.readline.assert_called_once()
+
+    def test_success_closes_by_itself_but_problems_wait_for_enter(self):
+        for flow, expected in ((lambda: True, 10.0), (lambda: False, None)):
+            with mock.patch.object(ffd, "_login_flow", side_effect=flow), \
+                 mock.patch.object(ffd, "wait_before_closing") as wait:
+                ffd.cmd_login_tui([])
+            wait.assert_called_once_with(expected)
+
+    def test_an_error_exit_still_leaves_the_message_readable(self):
+        with mock.patch.object(ffd, "_login_flow", side_effect=SystemExit(1)), \
+             mock.patch.object(ffd, "wait_before_closing") as wait:
+            with self.assertRaises(SystemExit):
+                ffd.cmd_login_tui([])
+        wait.assert_called_once_with(None)
+
+    # ---- the same, on a real pseudo-terminal -------------------------------
+
+    def run_on_pty(self, timeout_arg, send_enter_after=None):
+        import pty
+        import subprocess
+        master, slave = pty.openpty()
+        code = (
+            "import importlib.machinery as m, importlib.util as u\n"
+            f"l = m.SourceFileLoader('h', {HELPER_PATH!r}); mod = u.module_from_spec(u.spec_from_loader('h', l)); l.exec_module(mod)\n"
+            f"mod.wait_before_closing({timeout_arg!r})\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", code], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        started = time.monotonic()
+        try:
+            if send_enter_after is not None:
+                time.sleep(send_enter_after)
+                still_open = proc.poll() is None
+                os.write(master, b"\n")
+            else:
+                still_open = None
+            proc.wait(timeout=15)
+        finally:
+            os.close(master)
+        return still_open, time.monotonic() - started
+
+    def test_real_terminal_stays_open_until_enter(self):
+        still_open, took = self.run_on_pty(None, send_enter_after=1.0)
+        self.assertTrue(still_open, "window closed before Enter was pressed")
+        self.assertLess(took, 5)
+
+    def test_real_terminal_success_window_closes_on_its_own(self):
+        _open, took = self.run_on_pty(1.0)
+        self.assertGreaterEqual(took, 0.9)
+        self.assertLess(took, 6)
+
+
 class SuperviseGuardTests(unittest.TestCase):
     def test_serve_and_login_tui_are_not_supervisable(self):
         self.assertNotIn("serve", ffd.SUPERVISABLE_COMMANDS)

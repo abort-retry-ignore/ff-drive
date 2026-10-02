@@ -1996,7 +1996,39 @@ def cmd_login(_args) -> None:
     fail(f"open a terminal and run: {SELF_PATH} login-tui")
 
 
+def wait_before_closing(timeout: "float | None") -> None:
+    """Keep the sign-in window open long enough to read what happened.
+
+    The terminal closes the instant this process exits, which used to swallow
+    the very messages that say what to do next. Only when attached to a
+    terminal. timeout=None waits for Enter; otherwise it also closes by itself.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    if timeout is None:
+        print("Press Enter to close this window.")
+    else:
+        print(f"This window closes in {int(timeout)} seconds; press Enter to close it now.")
+    sys.stdout.flush()
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+        if ready:
+            sys.stdin.readline()
+    except (OSError, ValueError, KeyboardInterrupt):
+        pass
+
+
 def cmd_login_tui(_args) -> None:
+    ok = False
+    try:
+        ok = _login_flow()
+    finally:
+        # Also on fail()/SystemExit: an error message in a window that
+        # vanishes is no message at all. Success can close by itself.
+        wait_before_closing(10.0 if ok else None)
+
+
+def _login_flow() -> bool:
     if not Tools.rclone:
         fail("rclone not found")
     print()
@@ -2076,6 +2108,7 @@ def cmd_login_tui(_args) -> None:
         print()
         print("Done. Fast Fruit Drive is on. You can close this terminal.")
     print()
+    return True
 
 
 def cmd_configure(args) -> None:
